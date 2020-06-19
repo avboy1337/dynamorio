@@ -1,3 +1,10 @@
+编译命令
+set VSCMD_DEBUG=3
+%comspec% /k "C:\Program Files (x86)\Microsoft Visual Studio\2017\Enterprise\Common7\Tools\VsDevCmd.bat" vcvars_ver=14.16
+cmake.exe -A Win32 -G"Visual Studio 15" ..
+cmake.exe --build . --config RelWithDebInfo
+
+
 # DynamoRIO
 
 ![DynamoRIO logo](http://www.burningcutlery.com/images/dynamorio/drlogo.png)
