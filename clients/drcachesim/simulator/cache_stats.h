@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2015-2020 Google, Inc.  All rights reserved.
+ * Copyright (c) 2015-2022 Google, Inc.  All rights reserved.
  * **********************************************************/
 
 /*
@@ -41,12 +41,12 @@
 
 class cache_stats_t : public caching_device_stats_t {
 public:
-    explicit cache_stats_t(const std::string &miss_file = "", bool warmup_enabled = false,
-                           bool is_coherent = false);
+    explicit cache_stats_t(int block_size, const std::string &miss_file = "",
+                           bool warmup_enabled = false, bool is_coherent = false);
 
     // In addition to caching_device_stats_t::access,
     // cache_stats_t::access processes prefetching requests.
-    void
+    virtual void
     access(const memref_t &memref, bool hit,
            caching_device_block_t *cache_block) override;
 

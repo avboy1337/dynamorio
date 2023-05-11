@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2016-2020 Google, Inc.  All rights reserved.
+ * Copyright (c) 2016-2023 Google, Inc.  All rights reserved.
  * **********************************************************/
 
 /*
@@ -40,14 +40,15 @@
 #include "drcovlib.h"
 #include "instru.h"
 #include "../common/trace_entry.h"
+#include "../common/utils.h"
 #include <new>
 #include <limits.h> /* for USHRT_MAX */
 #include <stddef.h> /* for offsetof */
 #include <string.h> /* for strlen */
 
-static const ptr_uint_t MAX_INSTR_COUNT = 64 * 1024;
+static const uint MAX_INSTR_COUNT = 64 * 1024;
 
-void *(*offline_instru_t::user_load_)(module_data_t *module);
+void *(*offline_instru_t::user_load_)(module_data_t *module, int seg_idx);
 int (*offline_instru_t::user_print_)(void *data, char *dst, size_t max_len);
 void (*offline_instru_t::user_free_)(void *data);
 
@@ -56,7 +57,6 @@ void (*offline_instru_t::user_free_)(void *data);
 offline_instru_t::offline_instru_t()
     : instru_t(nullptr, false, nullptr, sizeof(offline_entry_t))
     , write_file_func_(nullptr)
-    , modfile_(INVALID_FILE)
 {
     // We can't use drmgr in standalone mode, but for post-processing it's just us,
     // so we just pick a note value.
@@ -64,16 +64,18 @@ offline_instru_t::offline_instru_t()
     standalone_ = true;
 }
 
-offline_instru_t::offline_instru_t(void (*insert_load_buf)(void *, instrlist_t *,
-                                                           instr_t *, reg_id_t),
-                                   bool memref_needs_info, drvector_t *reg_vector,
-                                   ssize_t (*write_file)(file_t file, const void *data,
-                                                         size_t count),
-                                   file_t module_file, bool disable_optimizations)
+offline_instru_t::offline_instru_t(
+    void (*insert_load_buf)(void *, instrlist_t *, instr_t *, reg_id_t),
+    bool memref_needs_info, drvector_t *reg_vector,
+    ssize_t (*write_file)(file_t file, const void *data, size_t count),
+    file_t module_file, file_t encoding_file, bool disable_optimizations,
+    void (*log)(uint level, const char *fmt, ...))
     : instru_t(insert_load_buf, memref_needs_info, reg_vector, sizeof(offline_entry_t),
                disable_optimizations)
     , write_file_func_(write_file)
     , modfile_(module_file)
+    , log_(log)
+    , encoding_file_(encoding_file)
 {
     drcovlib_status_t res = drmodtrack_init();
     DR_ASSERT(res == DRCOVLIB_SUCCESS);
@@ -89,12 +91,34 @@ offline_instru_t::offline_instru_t(void (*insert_load_buf)(void *, instrlist_t *
         DR_ASSERT(false);
     elide_memref_note_ = drmgr_reserve_note_range(1);
     DR_ASSERT(elide_memref_note_ != DRMGR_NOTE_NONE);
+
+    uint64 max_bb_instrs;
+    if (!dr_get_integer_option("max_bb_instrs", &max_bb_instrs))
+        max_bb_instrs = 256; /* current default */
+    max_block_encoding_size_ = static_cast<int>(max_bb_instrs) * MAX_INSTR_LENGTH;
+    encoding_lock_ = dr_mutex_create();
+    encoding_buf_sz_ = ALIGN_FORWARD(max_block_encoding_size_ * 10, dr_page_size());
+    encoding_buf_start_ = reinterpret_cast<byte *>(
+        dr_raw_mem_alloc(encoding_buf_sz_, DR_MEMPROT_READ | DR_MEMPROT_WRITE, nullptr));
+    encoding_buf_ptr_ = encoding_buf_start_;
+    // Write out the header which is just a 64-bit version.
+    *reinterpret_cast<uint64_t *>(encoding_buf_ptr_) = ENCODING_FILE_VERSION;
+    encoding_buf_ptr_ += sizeof(uint64_t);
 }
 
 offline_instru_t::~offline_instru_t()
 {
     if (standalone_)
         return;
+
+    dr_mutex_lock(encoding_lock_);
+    flush_instr_encodings();
+    dr_raw_mem_free(encoding_buf_start_, encoding_buf_sz_);
+    dr_mutex_unlock(encoding_lock_);
+    dr_mutex_destroy(encoding_lock_);
+    log_(1, "Wrote " UINT64_FORMAT_STRING " bytes to encoding file\n",
+         encoding_bytes_written_);
+
     drcovlib_status_t res;
     size_t size = 8192;
     char *buf;
@@ -115,11 +139,11 @@ offline_instru_t::~offline_instru_t()
 }
 
 void *
-offline_instru_t::load_custom_module_data(module_data_t *module)
+offline_instru_t::load_custom_module_data(module_data_t *module, int seg_idx)
 {
     void *user_data = nullptr;
     if (user_load_ != nullptr)
-        user_data = (*user_load_)(module);
+        user_data = (*user_load_)(module, seg_idx);
     const char *name = dr_module_preferred_name(module);
     // For vdso we include the entire contents so we can decode it during
     // post-processing.
@@ -129,13 +153,47 @@ offline_instru_t::load_custom_module_data(module_data_t *module)
           strstr(name, "linux-vdso.so") == name)) ||
         (module->names.file_name != NULL && strcmp(name, "[vdso]") == 0)) {
         void *alloc = dr_global_alloc(sizeof(custom_module_data_t));
-        return new (alloc) custom_module_data_t((const char *)module->start,
-                                                module->end - module->start, user_data);
+#ifdef WINDOWS
+        byte *start = module->start;
+        byte *end = module->end;
+#else
+        byte *start =
+            (module->num_segments > 0) ? module->segments[seg_idx].start : module->start;
+        byte *end =
+            (module->num_segments > 0) ? module->segments[seg_idx].end : module->end;
+#endif
+        return new (alloc)
+            custom_module_data_t((const char *)start, end - start, user_data);
     } else if (user_data != nullptr) {
         void *alloc = dr_global_alloc(sizeof(custom_module_data_t));
         return new (alloc) custom_module_data_t(nullptr, 0, user_data);
     }
     return nullptr;
+}
+
+int
+offline_instru_t::print_module_data_fields(
+    char *dst, size_t max_len, const void *custom_data, size_t custom_size,
+    int (*user_print_cb)(void *data, char *dst, size_t max_len), void *user_cb_data)
+{
+    char *cur = dst;
+    int len = dr_snprintf(dst, max_len, "v#%d,%zu,", CUSTOM_MODULE_VERSION, custom_size);
+    if (len < 0)
+        return -1;
+    cur += len;
+    if (cur - dst + custom_size > max_len)
+        return -1;
+    if (custom_size > 0) {
+        memcpy(cur, custom_data, custom_size);
+        cur += custom_size;
+    }
+    if (user_print_cb != nullptr) {
+        int res = (*user_print_cb)(user_cb_data, cur, max_len - (cur - dst));
+        if (res == -1)
+            return -1;
+        cur += res;
+    }
+    return (int)(cur - dst);
 }
 
 int
@@ -148,24 +206,8 @@ offline_instru_t::print_custom_module_data(void *data, char *dst, size_t max_len
     if (custom == nullptr) {
         return dr_snprintf(dst, max_len, "v#%d,0,", CUSTOM_MODULE_VERSION);
     }
-    char *cur = dst;
-    int len = dr_snprintf(dst, max_len, "v#%d,%zu,", CUSTOM_MODULE_VERSION, custom->size);
-    if (len < 0)
-        return -1;
-    cur += len;
-    if (cur - dst + custom->size > max_len)
-        return -1;
-    if (custom->size > 0) {
-        memcpy(cur, custom->base, custom->size);
-        cur += custom->size;
-    }
-    if (user_print_ != nullptr) {
-        int res = (*user_print_)(custom->user_data, cur, max_len - (cur - dst));
-        if (res == -1)
-            return -1;
-        cur += res;
-    }
-    return (int)(cur - dst);
+    return print_module_data_fields(dst, max_len, custom->base, custom->size, user_print_,
+                                    custom->user_data);
 }
 
 void
@@ -181,7 +223,7 @@ offline_instru_t::free_custom_module_data(void *data)
 }
 
 bool
-offline_instru_t::custom_module_data(void *(*load_cb)(module_data_t *module),
+offline_instru_t::custom_module_data(void *(*load_cb)(module_data_t *module, int seg_idx),
                                      int (*print_cb)(void *data, char *dst,
                                                      size_t max_len),
                                      void (*free_cb)(void *data))
@@ -217,13 +259,30 @@ offline_instru_t::get_entry_size(byte *buf_ptr) const
     return 0;
 }
 
-addr_t
-offline_instru_t::get_entry_addr(byte *buf_ptr) const
+int
+offline_instru_t::get_instr_count(byte *buf_ptr) const
 {
-    // TODO i#4014: To support -use_physical we would need to handle a PC
-    // entry here.
-    DR_ASSERT(!type_is_instr(get_entry_type(buf_ptr)));
     offline_entry_t *entry = (offline_entry_t *)buf_ptr;
+    if (entry->addr.type != OFFLINE_TYPE_PC)
+        return 0;
+    // TODO i#3995: We should *not* count "non-fetched" instrs so we'll match
+    // hardware performance counters.
+    // Xref i#4948 and i#4915 on getting rid of "non-fetched" instrs.
+    return entry->pc.instr_count;
+}
+
+addr_t
+offline_instru_t::get_entry_addr(void *drcontext, byte *buf_ptr) const
+{
+    offline_entry_t *entry = (offline_entry_t *)buf_ptr;
+    if (entry->addr.type == OFFLINE_TYPE_PC) {
+        // XXX i#4014: Use caching to avoid lookup for last queried modbase.
+        app_pc modbase;
+        if (drmodtrack_lookup_pc_from_index(drcontext, entry->pc.modidx, &modbase) !=
+            DRCOVLIB_SUCCESS)
+            return 0;
+        return reinterpret_cast<addr_t>(modbase) + static_cast<addr_t>(entry->pc.modoffs);
+    }
     return entry->addr.addr;
 }
 
@@ -278,6 +337,12 @@ offline_instru_t::append_marker(byte *buf_ptr, trace_marker_type_t type, uintptr
         buf_ptr += extra_size;
         val = (uint)val;
     }
+#else
+    // XXX i#5634: We're truncating timestamps and other values by limiting to
+    // pointer-sized payloads: what we should do is use multiple markers (need up to 3)
+    // to support 64-bit values in 32-bit builds.  However, this means we need an
+    // analysis-tool-visible extended-payload marker type, or maybe make the reader
+    // hide that from the user.
 #endif
     offline_entry_t *entry = (offline_entry_t *)buf_ptr;
     entry->extended.valueA = val;
@@ -309,11 +374,14 @@ offline_instru_t::append_thread_header(byte *buf_ptr, thread_id_t tid,
     offline_entry_t *entry = (offline_entry_t *)new_buf;
     entry->extended.type = OFFLINE_TYPE_EXTENDED;
     entry->extended.ext = OFFLINE_EXT_TYPE_HEADER;
-    entry->extended.valueA = OFFLINE_FILE_VERSION;
-    entry->extended.valueB = file_type;
+    entry->extended.valueA = file_type;
+    entry->extended.valueB = OFFLINE_FILE_VERSION;
     new_buf += sizeof(*entry);
     new_buf += append_tid(new_buf, tid);
     new_buf += append_pid(new_buf, dr_get_process_id());
+    new_buf += append_marker(new_buf, TRACE_MARKER_TYPE_CACHE_LINE_SIZE,
+                             proc_get_cache_line_size());
+    new_buf += append_marker(new_buf, TRACE_MARKER_TYPE_PAGE_SIZE, dr_page_size());
     return (int)(new_buf - buf_ptr);
 }
 
@@ -324,15 +392,32 @@ offline_instru_t::append_thread_header(byte *buf_ptr, thread_id_t tid)
 }
 
 int
-offline_instru_t::append_unit_header(byte *buf_ptr, thread_id_t tid)
+offline_instru_t::append_unit_header(byte *buf_ptr, thread_id_t tid, ptr_int_t window)
 {
     byte *new_buf = buf_ptr;
     offline_entry_t *entry = (offline_entry_t *)new_buf;
     entry->timestamp.type = OFFLINE_TYPE_TIMESTAMP;
-    entry->timestamp.usec = instru_t::get_timestamp();
+    uint64 frozen = frozen_timestamp_.load(std::memory_order_acquire);
+    entry->timestamp.usec = frozen != 0 ? frozen : instru_t::get_timestamp();
     new_buf += sizeof(*entry);
+    if (window >= 0)
+        new_buf += append_marker(new_buf, TRACE_MARKER_TYPE_WINDOW_ID, (uintptr_t)window);
     new_buf += append_marker(new_buf, TRACE_MARKER_TYPE_CPU_ID, instru_t::get_cpu_id());
     return (int)(new_buf - buf_ptr);
+}
+
+bool
+offline_instru_t::refresh_unit_header_timestamp(byte *buf_ptr, uint64 min_timestamp)
+{
+    offline_entry_t *stamp = reinterpret_cast<offline_entry_t *>(buf_ptr);
+    DR_ASSERT(stamp->timestamp.type == OFFLINE_TYPE_TIMESTAMP);
+    if (stamp->timestamp.usec < min_timestamp) {
+        log_(2, "%s: replacing " UINT64_FORMAT_STRING " with " UINT64_FORMAT_STRING "\n",
+             __FUNCTION__, stamp->timestamp.usec, min_timestamp);
+        stamp->timestamp.usec = min_timestamp;
+        return true;
+    }
+    return false;
 }
 
 int
@@ -363,34 +448,110 @@ offline_instru_t::insert_save_entry(void *drcontext, instrlist_t *ilist, instr_t
 }
 
 uint64_t
-offline_instru_t::get_modoffs(void *drcontext, app_pc pc)
+offline_instru_t::get_modoffs(void *drcontext, app_pc pc, OUT uint *modidx)
 {
     app_pc modbase;
-    if (drmodtrack_lookup(drcontext, pc, NULL, &modbase) != DRCOVLIB_SUCCESS)
+    if (drmodtrack_lookup(drcontext, pc, modidx, &modbase) != DRCOVLIB_SUCCESS)
         return 0;
     return pc - modbase;
+}
+
+// Caller must hold the encoding_lock.
+void
+offline_instru_t::flush_instr_encodings()
+{
+    DR_ASSERT(dr_mutex_self_owns(encoding_lock_));
+    size_t size = encoding_buf_ptr_ - encoding_buf_start_;
+    if (size == 0)
+        return;
+    ssize_t written = write_file_func_(encoding_file_, encoding_buf_start_, size);
+    log_(2, "%s: Wrote %zu/%zu bytes to encoding file\n", __FUNCTION__, written, size);
+    DR_ASSERT(written == static_cast<ssize_t>(size));
+    encoding_buf_ptr_ = encoding_buf_start_;
+    encoding_bytes_written_ += written;
+}
+
+void
+offline_instru_t::record_instr_encodings(void *drcontext, app_pc tag_pc,
+                                         per_block_t *per_block, instrlist_t *ilist)
+{
+    dr_mutex_lock(encoding_lock_);
+    per_block->id = encoding_id_++;
+
+    if (encoding_buf_ptr_ + max_block_encoding_size_ >=
+        encoding_buf_start_ + encoding_buf_sz_) {
+        flush_instr_encodings();
+    }
+    byte *buf_start = encoding_buf_ptr_;
+    byte *buf = buf_start;
+    buf += sizeof(encoding_entry_t);
+
+    bool in_emulation_region = false;
+    for (instr_t *instr = instrlist_first(ilist); instr != NULL;
+         instr = instr_get_next(instr)) {
+        instr_t *to_copy = nullptr;
+        emulated_instr_t emulation_info = { sizeof(emulation_info), 0 };
+        if (in_emulation_region) {
+            if (drmgr_is_emulation_end(instr))
+                in_emulation_region = false;
+        } else if (drmgr_is_emulation_start(instr)) {
+            bool ok = drmgr_get_emulated_instr_data(instr, &emulation_info);
+            DR_ASSERT(ok);
+            to_copy = emulation_info.instr;
+            in_emulation_region = true;
+        } else if (instr_is_app(instr)) {
+            to_copy = instr;
+        }
+        if (to_copy == nullptr)
+            continue;
+        // To handle application code hooked by DR we cannot just copy from
+        // instr_get_app_pc(): we have to encode.  Nearly all the time this
+        // will be a pure memcpy so this only incurs an actual encoding walk
+        // for the hooked level 4 instrs.
+        byte *end_pc =
+            instr_encode_to_copy(drcontext, to_copy, buf, instr_get_app_pc(to_copy));
+        DR_ASSERT(end_pc != nullptr);
+        buf = end_pc;
+        DR_ASSERT(buf < encoding_buf_start_ + encoding_buf_sz_);
+    }
+
+    encoding_entry_t *enc = reinterpret_cast<encoding_entry_t *>(buf_start);
+    enc->length = buf - buf_start;
+    enc->id = per_block->id;
+    // We put the ARM vs Thumb mode into the modoffs to ensure proper decoding.
+    enc->start_pc = reinterpret_cast<uint64_t>(
+        dr_app_pc_as_jump_target(instr_get_isa_mode(instrlist_first(ilist)), tag_pc));
+    log_(2, "%s: Recorded %zu bytes for id " UINT64_FORMAT_STRING " @ %p\n", __FUNCTION__,
+         enc->length, enc->id, tag_pc);
+
+    encoding_buf_ptr_ += enc->length;
+    dr_mutex_unlock(encoding_lock_);
 }
 
 int
 offline_instru_t::insert_save_pc(void *drcontext, instrlist_t *ilist, instr_t *where,
                                  reg_id_t reg_ptr, reg_id_t scratch, int adjust,
-                                 app_pc pc, uint instr_count)
+                                 app_pc pc, uint instr_count, per_block_t *per_block)
 {
-    app_pc modbase;
-    uint modidx;
-    if (drmodtrack_lookup(drcontext, pc, &modidx, &modbase) != DRCOVLIB_SUCCESS) {
-        // FIXME i#2062: add non-module support.  The plan for instrs is to have
-        // one entry w/ the start abs pc, and subsequent entries that pack the instr
-        // length for 10 instrs, 4 bits each, into a pc.modoffs field.  We will
-        // also need to store the type (read/write/prefetch*) and size for the
-        // memrefs.
-        modidx = 0;
-        modbase = pc;
-    }
     offline_entry_t entry;
     entry.pc.type = OFFLINE_TYPE_PC;
-    // We put the ARM vs Thumb mode into the modoffs to ensure proper decoding.
-    uint64_t modoffs = dr_app_pc_as_jump_target(instr_get_isa_mode(where), pc) - modbase;
+    app_pc modbase;
+    uint modidx;
+    uint64_t modoffs;
+    if (drmodtrack_lookup(drcontext, pc, &modidx, &modbase) == DRCOVLIB_SUCCESS) {
+        // TODO i#2062: We need to also identify modified library code and record
+        // its encodings.  The plan is to augment drmodtrack to track this for us;
+        // for now we will incorrectly use the original bits in the trace.
+        //
+        // We put the ARM vs Thumb mode into the modoffs to ensure proper decoding.
+        modoffs = dr_app_pc_as_jump_target(instr_get_isa_mode(where), pc) - modbase;
+        DR_ASSERT(modidx != PC_MODIDX_INVALID);
+    } else {
+        modidx = PC_MODIDX_INVALID;
+        // For generated code we store the id for matching with the encodings recorded
+        // into the encoding file.
+        modoffs = per_block->id;
+    }
     // Check that the values we want to assign to the bitfields in offline_entry_t do not
     // overflow. In i#2956 we observed an overflow for the modidx field.
     DR_ASSERT(modoffs < uint64_t(1) << PC_MODOFFS_BITS);
@@ -414,6 +575,8 @@ offline_instru_t::insert_save_type_and_size(void *drcontext, instrlist_t *ilist,
         type = instru_t::instr_to_prefetch_type(app);
         // Prefetch instruction may have zero sized mem reference.
         size = 1;
+    } else if (instr_is_flush(app)) {
+        type = instru_t::instr_to_flush_type(app);
     }
     offline_entry_t entry;
     entry.extended.type = OFFLINE_TYPE_EXTENDED;
@@ -515,15 +678,17 @@ offline_instru_t::instr_has_multiple_different_memrefs(instr_t *instr)
 }
 
 int
-offline_instru_t::instrument_memref(void *drcontext, instrlist_t *ilist, instr_t *where,
-                                    reg_id_t reg_ptr, int adjust, instr_t *app,
-                                    opnd_t ref, int ref_index, bool write,
+offline_instru_t::instrument_memref(void *drcontext, void *bb_field, instrlist_t *ilist,
+                                    instr_t *where, reg_id_t reg_ptr, int adjust,
+                                    instr_t *app, opnd_t ref, int ref_index, bool write,
                                     dr_pred_type_t pred)
 {
     // Check whether we can elide this address.
-    // Be sure to start with "app" and not "where" to handle post-instr insertion
-    // such as for exclusive stores.
-    for (instr_t *prev = instr_get_prev(app); prev != nullptr && !instr_is_app(prev);
+    // We expect our labels to be at "where" due to drbbdup's handling of block-final
+    // instrs, but for exclusive store post-instr insertion we make sure we walk
+    // across that app instr.
+    for (instr_t *prev = instr_get_prev(where);
+         prev != nullptr && (!instr_is_app(prev) || instr_is_exclusive_store(prev));
          prev = instr_get_prev(prev)) {
         int elided_index;
         bool elided_is_store;
@@ -539,12 +704,13 @@ offline_instru_t::instrument_memref(void *drcontext, instrlist_t *ilist, instr_t
     // We allow either 0 or all 1's as the type so no need to write anything else,
     // unless a filter is in place in which case we need a PC entry.
     if (memref_needs_full_info_) {
+        per_block_t *per_block = reinterpret_cast<per_block_t *>(bb_field);
         reg_id_t reg_tmp;
         drreg_status_t res =
             drreg_reserve_register(drcontext, ilist, where, reg_vector_, &reg_tmp);
         DR_ASSERT(res == DRREG_SUCCESS); // Can't recover.
         adjust += insert_save_pc(drcontext, ilist, where, reg_ptr, reg_tmp, adjust,
-                                 instr_get_app_pc(app), 0);
+                                 instr_get_app_pc(app), 0, per_block);
         if (instr_has_multiple_different_memrefs(app)) {
             // i#2756: post-processing can't determine which memref this is, so we
             // insert a type entry.  (For instrs w/ identical memrefs, like an ALU
@@ -561,30 +727,33 @@ offline_instru_t::instrument_memref(void *drcontext, instrlist_t *ilist, instr_t
     return adjust;
 }
 
-// We stored the instr count in *bb_field in bb_analysis().
+// We stored the instr count in bb_field==per_block_t in bb_analysis().
 int
-offline_instru_t::instrument_instr(void *drcontext, void *tag, void **bb_field,
+offline_instru_t::instrument_instr(void *drcontext, void *tag, void *bb_field,
                                    instrlist_t *ilist, instr_t *where, reg_id_t reg_ptr,
                                    int adjust, instr_t *app)
 {
+    per_block_t *per_block = reinterpret_cast<per_block_t *>(bb_field);
     app_pc pc;
     reg_id_t reg_tmp;
     if (!memref_needs_full_info_) {
         // We write just once per bb, if not filtering.
-        if ((ptr_uint_t)*bb_field > MAX_INSTR_COUNT)
+        if (per_block->instr_count > MAX_INSTR_COUNT)
             return adjust;
         pc = dr_fragment_app_pc(tag);
     } else {
-        // XXX: For repstr do we want tag insted of skipping rep prefix?
+        DR_ASSERT(instr_is_app(app));
         pc = instr_get_app_pc(app);
     }
     drreg_status_t res =
         drreg_reserve_register(drcontext, ilist, where, reg_vector_, &reg_tmp);
     DR_ASSERT(res == DRREG_SUCCESS); // Can't recover.
-    adjust += insert_save_pc(drcontext, ilist, where, reg_ptr, reg_tmp, adjust, pc,
-                             memref_needs_full_info_ ? 1 : (uint)(ptr_uint_t)*bb_field);
+    adjust += insert_save_pc(
+        drcontext, ilist, where, reg_ptr, reg_tmp, adjust, pc,
+        memref_needs_full_info_ ? 1 : static_cast<uint>(per_block->instr_count),
+        per_block);
     if (!memref_needs_full_info_)
-        *(ptr_uint_t *)bb_field = MAX_INSTR_COUNT + 1;
+        per_block->instr_count = MAX_INSTR_COUNT + 1;
     res = drreg_unreserve_register(drcontext, ilist, where, reg_tmp);
     DR_ASSERT(res == DRREG_SUCCESS); // Can't recover.
     return adjust;
@@ -599,36 +768,74 @@ offline_instru_t::instrument_ibundle(void *drcontext, instrlist_t *ilist, instr_
     return adjust;
 }
 
+int
+offline_instru_t::instrument_instr_encoding(void *drcontext, void *tag, void *bb_field,
+                                            instrlist_t *ilist, instr_t *where,
+                                            reg_id_t reg_ptr, int adjust, instr_t *app)
+{
+    // We emit non-module-code or modified-module-code encodings separately in
+    // record_instr_encodings().  Encodings for static code are added in the
+    // post-processor.
+    return adjust;
+}
+
+int
+offline_instru_t::instrument_rseq_entry(void *drcontext, instrlist_t *ilist,
+                                        instr_t *where, instr_t *rseq_label,
+                                        reg_id_t reg_ptr, int adjust)
+{
+    dr_instr_label_data_t *data = instr_get_label_data_area(rseq_label);
+    reg_id_t reg_tmp;
+    drreg_status_t res =
+        drreg_reserve_register(drcontext, ilist, where, reg_vector_, &reg_tmp);
+    DR_ASSERT(res == DRREG_SUCCESS); // Can't recover.
+    // We may need 2 entries for our marker.  We write the entry marker with payload
+    // data[0]==rseq end.  We do not use a separate marker to write data[1]==rseq
+    // handler as an abort marker will have the handler.
+    static constexpr int RSEQ_LABEL_END_PC_INDEX = 0;
+    offline_entry_t entries[2];
+    int size = append_marker((byte *)entries, TRACE_MARKER_TYPE_RSEQ_ENTRY,
+                             data->data[RSEQ_LABEL_END_PC_INDEX]);
+    DR_ASSERT(size % sizeof(offline_entry_t) == 0);
+    size /= sizeof(offline_entry_t);
+    DR_ASSERT(size <= static_cast<int>(sizeof(entries)));
+    for (int i = 0; i < size; i++) {
+        adjust += insert_save_entry(drcontext, ilist, where, reg_ptr, reg_tmp, adjust,
+                                    &entries[i]);
+    }
+    res = drreg_unreserve_register(drcontext, ilist, where, reg_tmp);
+    DR_ASSERT(res == DRREG_SUCCESS); // Can't recover.
+    return adjust;
+}
+
 void
 offline_instru_t::bb_analysis(void *drcontext, void *tag, void **bb_field,
                               instrlist_t *ilist, bool repstr_expanded)
 {
-    instr_t *instr;
-    ptr_uint_t count = 0;
-    app_pc last_xl8 = NULL;
-    if (repstr_expanded) {
-        // The same-translation check below is not sufficient as drutil uses
-        // two different translations to deal with complexities.
-        // Thus we hardcode this.
-        count = 1;
-    } else {
-        for (instr = instrlist_first_app(ilist); instr != NULL;
-             instr = instr_get_next_app(instr)) {
-            // To deal with app2app changes, we do not double-count consecutive instrs
-            // with the same translation.
-            if (instr_get_app_pc(instr) != last_xl8) {
-                // Hooked native functions end up with an artifical jump whose translation
-                // is its target.  We do not want to count these.
-                if (!(instr_is_ubr(instr) && opnd_is_pc(instr_get_target(instr)) &&
-                      opnd_get_pc(instr_get_target(instr)) == instr_get_app_pc(instr)))
-                    ++count;
-            }
-            last_xl8 = instr_get_app_pc(instr);
-        }
-    }
-    *bb_field = (void *)count;
+    per_block_t *per_block =
+        reinterpret_cast<per_block_t *>(dr_thread_alloc(drcontext, sizeof(*per_block)));
+    *bb_field = per_block;
+
+    per_block->instr_count = instru_t::count_app_instrs(ilist);
 
     identify_elidable_addresses(drcontext, ilist, OFFLINE_FILE_VERSION);
+
+    app_pc tag_pc = dr_fragment_app_pc(tag);
+    if (drmodtrack_lookup(drcontext, tag_pc, nullptr, nullptr) != DRCOVLIB_SUCCESS) {
+        // For (unmodified) library code we do not need to record encodings as we
+        // rely on access to the binary during post-processing.
+        //
+        // TODO i#2062: We need to also identify modified library code and record
+        // its encodings.  The plan is to augment drmodtrack to track this for us;
+        // for now we will incorrectly use the original bits in the trace.
+        record_instr_encodings(drcontext, tag_pc, per_block, ilist);
+    }
+}
+
+void
+offline_instru_t::bb_analysis_cleanup(void *drcontext, void *bb_field)
+{
+    dr_thread_free(drcontext, bb_field, sizeof(per_block_t));
 }
 
 bool
@@ -649,7 +856,7 @@ offline_instru_t::opnd_is_elidable(opnd_t memop, OUT reg_id_t &base, int version
     if (!opnd_is_near_base_disp(memop) ||
         // We're assuming displacements are all factored out, such that we can share
         // a base across all uses without subtracting the original disp.
-        // TODO(i#2001): This is blocking elision of SP bases on AArch64.  We should
+        // TODO(i#4898): This is blocking elision of SP bases on AArch64.  We should
         // add disp subtraction by storing the disp along with reg_vals in raw2trace
         // for AArch64.
         !opnd_disp_is_elidable(memop) ||
@@ -721,6 +928,24 @@ offline_instru_t::identify_elidable_addresses(void *drcontext, instrlist_t *ilis
     if (memref_needs_full_info_)
         return;
     reg_id_set_t saw_base;
+    for (instr_t *instr = instrlist_first(ilist); instr != NULL;
+         instr = instr_get_next(instr)) {
+        // XXX: We turn off address elision for bbs containing emulation sequences
+        // or instrs that are expanded into emulation sequences like scatter/gather
+        // and rep stringop. As instru_offline and raw2trace see different instrs in
+        // these bbs (expanded seq vs original app instr), there may be mismatches in
+        // identifying elision opportunities. We can possibly provide a consistent
+        // view by expanding the instr in raw2trace (e.g. using
+        // drx_expand_scatter_gather) when building the ilist.
+        if (drutil_instr_is_stringop_loop(instr)
+            // TODO i#3837: Scatter/gather support NYI on ARM/AArch64.
+            IF_X86(|| instr_is_scatter(instr) || instr_is_gather(instr))) {
+            return;
+        }
+        if (drmgr_is_emulation_start(instr) || drmgr_is_emulation_end(instr)) {
+            return;
+        }
+    }
     for (instr_t *instr = instrlist_first_app(ilist); instr != NULL;
          instr = instr_get_next_app(instr)) {
         // For now we bail at predication.
@@ -729,36 +954,37 @@ offline_instru_t::identify_elidable_addresses(void *drcontext, instrlist_t *ilis
             continue;
         }
         // Use instr_{reads,writes}_memory() to rule out LEA and NOP.
-        if (!instr_reads_memory(instr) && !instr_writes_memory(instr))
-            continue;
-        int mem_count = 0;
-        for (int i = 0; i < instr_num_srcs(instr); i++) {
-            if (opnd_is_memory_reference(instr_get_src(instr, i))) {
-                opnd_check_elidable(drcontext, ilist, instr, instr_get_src(instr, i), i,
-                                    mem_count, false, version, saw_base);
-                ++mem_count;
+        if (instr_reads_memory(instr) || instr_writes_memory(instr)) {
+            int mem_count = 0;
+            for (int i = 0; i < instr_num_srcs(instr); i++) {
+                if (opnd_is_memory_reference(instr_get_src(instr, i))) {
+                    opnd_check_elidable(drcontext, ilist, instr, instr_get_src(instr, i),
+                                        i, mem_count, false, version, saw_base);
+                    ++mem_count;
+                }
+            }
+            // Rule out sharing with any dest if the base is written to.  The ISA
+            // does not specify the ordering of multiple dests.
+            auto reg_it = saw_base.begin();
+            while (reg_it != saw_base.end()) {
+                if (instr_writes_to_reg(instr, *reg_it, DR_QUERY_INCLUDE_COND_DSTS))
+                    reg_it = saw_base.erase(reg_it);
+                else
+                    ++reg_it;
+            }
+            mem_count = 0;
+            for (int i = 0; i < instr_num_dsts(instr); i++) {
+                if (opnd_is_memory_reference(instr_get_dst(instr, i))) {
+                    opnd_check_elidable(drcontext, ilist, instr, instr_get_dst(instr, i),
+                                        i, mem_count, true, version, saw_base);
+                    ++mem_count;
+                }
             }
         }
-        auto reg_it = saw_base.begin();
-        while (reg_it != saw_base.end()) {
-            if (instr_writes_to_reg(instr, *reg_it, DR_QUERY_INCLUDE_COND_DSTS))
-                reg_it = saw_base.erase(reg_it);
-            else
-                ++reg_it;
-        }
-        mem_count = 0;
-        for (int i = 0; i < instr_num_dsts(instr); i++) {
-            if (opnd_is_memory_reference(instr_get_dst(instr, i))) {
-                opnd_check_elidable(drcontext, ilist, instr, instr_get_dst(instr, i), i,
-                                    mem_count, true, version, saw_base);
-                ++mem_count;
-            }
-        }
-        // Rule out sharing with prior *or* subsequent instrs if the base is written
-        // to.  The ISA does not specify the ordering of multiple dests.
+        // Rule out sharing with subsequent instrs if the base is written to.
         // TODO(i#2001): Add special support for eliding the xsp base of push+pop
         // instructions.
-        reg_it = saw_base.begin();
+        auto reg_it = saw_base.begin();
         while (reg_it != saw_base.end()) {
             if (instr_writes_to_reg(instr, *reg_it, DR_QUERY_INCLUDE_COND_DSTS))
                 reg_it = saw_base.erase(reg_it);

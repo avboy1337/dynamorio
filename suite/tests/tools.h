@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2011-2020 Google, Inc.  All rights reserved.
+ * Copyright (c) 2011-2022 Google, Inc.  All rights reserved.
  * Copyright (c) 2003-2010 VMware, Inc.  All rights reserved.
  * **********************************************************/
 
@@ -73,6 +73,7 @@
 #else
 #    include <windows.h>
 #    include <process.h> /* _beginthreadex */
+#    include <stdlib.h>  /* _set_error_mode */
 #    if defined(DEBUG) && !defined(NO_DBG_CRT)
 #        include <crtdbg.h>
 #    endif
@@ -88,10 +89,13 @@
 #undef PFX
 #define PFX "0x" PFMT
 
-#if defined(AARCH64) && SIGSTKSZ < 16384
+#ifdef LINUX
+#    include <linux/version.h>
+#    if defined(AARCH64) && LINUX_VERSION_CODE < KERNEL_VERSION(4, 3, 0)
 /* SIGSTKSZ was incorrectly defined in Linux releases before 4.3. */
-#    undef SIGSTKSZ
-#    define SIGSTKSZ 16384
+#        undef SIGSTKSZ
+#        define SIGSTKSZ 16384
+#    endif
 #endif
 
 #ifdef __cplusplus
@@ -276,7 +280,7 @@ typedef enum {
 #else
 /* FIXME: varargs for windows...for now since we don't care about efficiency we do this:
  */
-static void
+static inline void
 VERBOSE_PRINT(const char *fmt, ...)
 {
 }
@@ -325,9 +329,9 @@ intercept_signal(int sig, handler_3_t handler, bool sigstack);
 #    define NOP_NOP_NOP asm("nop\n nop\n nop\n")
 #    ifdef X86
 #        ifdef MACOS
-#            define NOP_NOP_CALL(tgt) asm("nop\n nop\n call _" #            tgt)
+#            define NOP_NOP_CALL(tgt) asm("nop\n nop\n call _" #tgt)
 #        else
-#            define NOP_NOP_CALL(tgt) asm("nop\n nop\n call " #            tgt)
+#            define NOP_NOP_CALL(tgt) asm("nop\n nop\n call " #tgt)
 #        endif
 #    elif defined(AARCHXX)
 /* Make sure to mark LR/X30 as clobbered to avoid functions like
@@ -353,6 +357,8 @@ print(const char *fmt, ...);
 /* in tools_asm.asm */
 int
 code_self_mod(int iters);
+void
+icache_sync(void *addr);
 /* these don't need asm, but must be adjacent to code_self_mod and in order */
 int
 code_inc(int foo);
@@ -360,7 +366,18 @@ int
 code_dec(int foo);
 int
 dummy(void);
-#ifdef AARCHXX
+#ifdef DR_HOST_NOT_TARGET
+static inline void
+tools_clear_icache(void *start, void *end)
+{
+    /* We need this function to build, but we expect to never run it for host!=target
+     * (an artifact of imperfect DR modularity for managed execution vs utility
+     * library: i#1684, etc.).
+     */
+    assert(false);
+}
+#elif defined(AARCHXX)
+/* In tools.c asm code. */
 void
 tools_clear_icache(void *start, void *end);
 #endif
@@ -433,13 +450,13 @@ size(Code_Snippet func)
     return ret_val;
 }
 
-static int
+static inline int
 test(void *foo, int val)
 {
     return (*(int (*)(int))foo)(val);
 }
 
-static int
+static inline int
 call(Code_Snippet func, int val)
 {
     switch (func) {
@@ -504,7 +521,7 @@ copy_to_buf_cross_page(char *buf, size_t buf_len, size_t *copied_len, Code_Snipp
     return copy_to_buf_normal(buf, buf_len, copied_len, func);
 }
 
-static char *
+static inline char *
 copy_to_buf(char *buf, size_t buf_len, size_t *copied_len, Code_Snippet func,
             Copy_Mode mode)
 {
@@ -648,7 +665,7 @@ protect_mem_check(void *start, size_t len, int prot, int expected);
 void *
 reserve_memory(int size);
 
-static void
+static inline void
 test_print(void *buf, int n)
 {
     print("%d\n", test(buf, n));
@@ -819,6 +836,27 @@ my_setenv(const char *var, const char *value)
     return setenv(var, value, 1 /*override*/) == 0;
 #else
     return SetEnvironmentVariable(var, value) == TRUE;
+#endif
+}
+
+static inline bool
+my_getenv(const char *var, char *dest, size_t size)
+{
+#ifdef UNIX
+    const char *value = getenv(var);
+    if (value == NULL)
+        return false;
+    strncpy(dest, value, size);
+    dest[size - 1] = 0;
+    return true;
+#else
+    unsigned int ret = GetEnvironmentVariable(var, dest, (DWORD)size);
+    if (ret == 0) {
+        fprintf(stderr, "Env variable %s returned 0 (not found?)\n", var);
+    } else if (ret > size) {
+        fprintf(stderr, "Env variable %s needs %u bytes of space!\n", var, ret);
+    }
+    return ret > 0 && ret <= size;
 #endif
 }
 

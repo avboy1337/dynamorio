@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2019-2020 Google, Inc. All rights reserved.
+ * Copyright (c) 2019-2022 Google, Inc. All rights reserved.
  * Copyright (c) 2016 ARM Limited. All rights reserved.
  * **********************************************************/
 
@@ -37,7 +37,10 @@
 
 #include "../asm_defines.asm"
 START_FILE
+
+#if !(defined(MACOS) && defined(AARCH64))
 #include "include/syscall.h"
+#endif
 
 #ifndef UNIX
 # error Non-Unix is not supported
@@ -115,12 +118,20 @@ GLOBAL_LABEL(unexpected_return:)
         JUMP  GLOBAL_REF(unexpected_return)
         END_FUNC(unexpected_return)
 
-/* All CPU ID registers are accessible only in privileged modes. */
-        DECLARE_FUNC(cpuid_supported)
-GLOBAL_LABEL(cpuid_supported:)
-        mov      w0, #0
+/* bool mrs_id_reg_supported(void)
+ * Checks for kernel support of the MRS instr when reading system registers
+ * above exception level EL0, by attempting to read Instruction Set Attribute
+ * Register 0. Some older Linux kernels do not support reading system registers
+ * above exception level 0 (EL0), raising a SIGILL. This is rare now as later
+ * versions have all implemented a trap-and-emulate mechanism for a set of
+ * system registers above EL0, of which ID_AA64ISAR0_EL1 is one.
+ */
+        DECLARE_FUNC(mrs_id_reg_supported)
+GLOBAL_LABEL(mrs_id_reg_supported:)
+        mrs     x0, ID_AA64ISAR0_EL1
+        mov     w0, #1
         ret
-        END_FUNC(cpuid_supported)
+        END_FUNC(mrs_id_reg_supported)
 
 /* void call_switch_stack(void *func_arg,             // REG_X0
  *                        byte *stack,                // REG_X1
@@ -155,7 +166,6 @@ call_dispatch_alt_stack_no_free:
         ret
         END_FUNC(call_switch_stack)
 
-#ifdef CLIENT_INTERFACE
 /*
  * Calls the specified function 'func' after switching to the DR stack
  * for the thread corresponding to 'drcontext'.
@@ -197,7 +207,6 @@ GLOBAL_LABEL(dr_call_on_clean_stack:)
         ldp      x29, x30, [sp], #16
         ret
         END_FUNC(dr_call_on_clean_stack)
-#endif /* CLIENT_INTERFACE */
 
 #ifndef NOT_DYNAMORIO_CORE_PROPER
 
@@ -289,12 +298,14 @@ GLOBAL_LABEL(dynamorio_app_take_over:)
         END_FUNC(dynamorio_app_take_over)
 
 /*
- * cleanup_and_terminate(dcontext_t *dcontext,     // X0 -> X19
- *                       int sysnum,               // W1 -> W20 = syscall #
- *                       int sys_arg1/param_base,  // W2 -> W21 = arg1 for syscall
- *                       int sys_arg2,             // W3 -> W22 = arg2 for syscall
- *                       bool exitproc,            // W4 -> W23
- *                       (2 more args that are ignored: Mac-only))
+ * cleanup_and_terminate(dcontext_t *dcontext,        // X0 -> X19
+ *                   int sysnum,                      // X1 -> X20 = syscall #
+ *                   ptr_uint_t sys_arg1/param_base,  // X2 -> X21 = arg1 for syscall
+ *                   ptr_uint_t sys_arg2,             // X3 -> X22 = arg2 for syscall
+ *                   bool exitproc,                   // X4 -> X23
+ *                   (These 2 args are only used for Mac thread exit:)
+ *                   ptr_uint_t sys_arg3,             // X5 -> X26 = arg3 for syscall
+ *                   ptr_uint_t sys_arg4)             // X6 -> X27 = arg4 for syscall
  *
  * See decl in arch_exports.h for description.
  */
@@ -302,17 +313,20 @@ GLOBAL_LABEL(dynamorio_app_take_over:)
 GLOBAL_LABEL(cleanup_and_terminate:)
         /* move argument registers to callee saved registers */
         mov      x19, x0  /* dcontext ptr size */
-        mov      w20, w1  /* sysnum 32-bit int */
-        mov      w21, w2  /* sys_arg1 32-bit int */
-        mov      w22, w3  /* sys_arg2 32-bit int */
-        mov      w23, w4  /* exitproc 32-bit int */
+        mov      x20, x1  /* sysnum */
+        mov      x21, x2  /* sys_arg1 */
+        mov      x22, x3  /* sys_arg2 */
+        mov      x23, x4  /* exitproc */
                           /* x24 reserved for dstack ptr */
                           /* x25 reserved for syscall ptr */
+#ifdef MACOS
+        mov      x26, x5  /* sys_arg3 */
+        mov      x27, x6  /* sys_arg4 */
+#endif
 
         /* inc exiting_thread_count to avoid being killed once off all_threads list */
-        adrp     x0, :got:exiting_thread_count
-        ldr      x0, [x0, #:got_lo12:exiting_thread_count]
-        CALLC2(atomic_add, x0, #1)
+        AARCH64_ADRP_GOT_LDR(GLOBAL_REF(exiting_thread_count), x0)
+        CALLC2(GLOBAL_REF(atomic_add), x0, #1)
 
         /* save dcontext->dstack for freeing later and set dcontext->is_exiting */
         mov      w1, #1
@@ -335,18 +349,16 @@ cat_thread_only:
         CALLC0(GLOBAL_REF(dynamo_thread_exit))
 cat_no_thread:
         /* switch to d_r_initstack for cleanup of dstack */
-        adrp     x26, :got:initstack_mutex
-        ldr      x26, [x26, #:got_lo12:initstack_mutex]
+        AARCH64_ADRP_GOT_LDR(GLOBAL_REF(initstack_mutex), x26)
 cat_spin:
-        CALLC2(atomic_swap, x26, #1)
+        CALLC2(GLOBAL_REF(atomic_swap), x26, #1)
         cbz      w0, cat_have_lock
         yield
         b        cat_spin
 
 cat_have_lock:
         /* switch stack */
-        adrp     x0, :got:d_r_initstack
-        ldr      x0, [x0, #:got_lo12:d_r_initstack]
+        AARCH64_ADRP_GOT_LDR(GLOBAL_REF(d_r_initstack), x0)
         ldr      x0, [x0]
         mov      sp, x0
 
@@ -354,20 +366,22 @@ cat_have_lock:
         CALLC1(GLOBAL_REF(dynamo_thread_stack_free_and_exit), x24) /* pass dstack */
 
         /* give up initstack_mutex */
-        adrp     x0, :got:initstack_mutex
-        ldr      x0, [x0, #:got_lo12:initstack_mutex]
+        AARCH64_ADRP_GOT_LDR(GLOBAL_REF(initstack_mutex), x0)
         mov      x1, #0
         str      x1, [x0]
 
         /* dec exiting_thread_count (allows another thread to kill us) */
-        adrp     x0, :got:exiting_thread_count
-        ldr      x0, [x0, #:got_lo12:exiting_thread_count]
-        CALLC2(atomic_add, x0, #-1)
+        AARCH64_ADRP_GOT_LDR(GLOBAL_REF(exiting_thread_count), x0)
+        CALLC2(GLOBAL_REF(atomic_add), x0, #-1)
 
         /* put system call number in x8 */
-        mov      w0, w21 /* sys_arg1 32-bit int */
-        mov      w1, w22 /* sys_arg2 32-bit int */
-        mov      w8, w20 /* int sys_call */
+        mov      x0, x21 /* sys_arg1 */
+        mov      x1, x22 /* sys_arg2 */
+#ifdef MACOS
+        mov      x3, x26  /* sys_arg3 */
+        mov      x4, x27  /* sys_arg4 */
+#endif
+        mov      SYSNUM_REG, w20 /* sys_call */
 
         br       x25  /* go do the syscall! */
         bl       GLOBAL_REF(unexpected_return) /* FIXME i#1569: NYI */
@@ -386,8 +400,13 @@ GLOBAL_LABEL(atomic_add:)
 
         DECLARE_FUNC(global_do_syscall_int)
 GLOBAL_LABEL(global_do_syscall_int:)
+#ifdef MACOS
+        mov      x16, #0
+        svc      #0x80
+#else
         /* FIXME i#1569: NYI on AArch64 */
         svc      #0
+#endif
         bl       GLOBAL_REF(unexpected_return)
         END_FUNC(global_do_syscall_int)
 
@@ -408,7 +427,7 @@ DECLARE_GLOBAL(safe_read_asm_recover)
         DECLARE_FUNC(safe_read_asm)
 GLOBAL_LABEL(safe_read_asm:)
         cmp      ARG3, #0
-1:      b.eq     safe_read_asm_recover
+1:      b.eq     safe_read_asm_recover_local
 ADDRTAKEN_LABEL(safe_read_asm_pre:)
         ldrb     w3, [ARG2]
 ADDRTAKEN_LABEL(safe_read_asm_mid:)
@@ -419,11 +438,10 @@ ADDRTAKEN_LABEL(safe_read_asm_post:)
         add      ARG1, ARG1, #1
         b        1b
 ADDRTAKEN_LABEL(safe_read_asm_recover:)
+safe_read_asm_recover_local:
         mov      x0, ARG2
         ret
         END_FUNC(safe_read_asm)
-
-#ifdef CLIENT_INTERFACE
 
 /* Xref x86.asm dr_try_start about calling dr_setjmp without a call frame.
  *
@@ -495,8 +513,6 @@ GLOBAL_LABEL(atomic_swap:)
         ret
         END_FUNC(atomic_swap)
 
-#endif /* CLIENT_INTERFACE */
-
 #ifdef UNIX
         DECLARE_FUNC(client_int_syscall)
 GLOBAL_LABEL(client_int_syscall:)
@@ -515,15 +531,26 @@ GLOBAL_LABEL(_dynamorio_runtime_resolve:)
 #endif /* UNIX */
 
 #ifdef LINUX
-
+/* thread_id_t dynamorio_clone(uint flags, byte *newsp, void *ptid, void *tls,
+ *                             void *ctid, void (*func)(void))
+ */
         DECLARE_FUNC(dynamorio_clone)
 GLOBAL_LABEL(dynamorio_clone:)
-        bl       GLOBAL_REF(unexpected_return) /* FIXME i#1569: NYI */
+        stp      ARG6, x0, [ARG2, #-16]! /* func is now on TOS of newsp */
+        /* All args are already in syscall registers. */
+        mov      SYSNUM_REG, #SYS_clone
+        svc      #0
+        cbnz     x0, dynamorio_clone_parent
+        ldp      x0, x1, [sp], #16
+        blr      x0
+        bl       GLOBAL_REF(unexpected_return)
+dynamorio_clone_parent:
+        ret
         END_FUNC(dynamorio_clone)
 
         DECLARE_FUNC(dynamorio_sigreturn)
 GLOBAL_LABEL(dynamorio_sigreturn:)
-        mov      w8, #SYS_rt_sigreturn
+        mov      SYSNUM_REG, #SYS_rt_sigreturn
         svc      #0
         bl       GLOBAL_REF(unexpected_return)
         END_FUNC(dynamorio_sigreturn)
@@ -531,7 +558,7 @@ GLOBAL_LABEL(dynamorio_sigreturn:)
         DECLARE_FUNC(dynamorio_sys_exit)
 GLOBAL_LABEL(dynamorio_sys_exit:)
         mov      w0, #0 /* exit code: hardcoded */
-        mov      w8, #SYS_exit
+        mov      SYSNUM_REG, #SYS_exit
         svc      #0
         bl       GLOBAL_REF(unexpected_return)
         END_FUNC(dynamorio_sys_exit)
@@ -541,15 +568,45 @@ GLOBAL_LABEL(dynamorio_sys_exit:)
 #  ifndef HAVE_SIGALTSTACK
 #   error NYI
 #  endif
-        DECLARE_FUNC(master_signal_handler)
-GLOBAL_LABEL(master_signal_handler:)
+        DECLARE_FUNC(main_signal_handler)
+GLOBAL_LABEL(main_signal_handler:)
         mov      ARG4, sp /* pass as extra arg */
-        b        GLOBAL_REF(master_signal_handler_C) /* chain call */
-        END_FUNC(master_signal_handler)
+        b        GLOBAL_REF(main_signal_handler_C) /* chain call */
+        END_FUNC(main_signal_handler)
 
 # endif /* NOT_DYNAMORIO_CORE_PROPER */
 
 #endif /* LINUX */
+
+
+#if defined(MACOS) && defined(AARCH64)
+        DECLARE_FUNC(dynamorio_sigreturn)
+GLOBAL_LABEL(dynamorio_sigreturn:)
+        /* TODO i#5383: Get correct syscall number for svc. */
+        brk 0xb001 /* For now we break with a unique code. */
+        END_FUNC(dynamorio_sigreturn)
+
+        DECLARE_FUNC(dynamorio_sys_exit)
+GLOBAL_LABEL(dynamorio_sys_exit:)
+        /* TODO i#5383: Get correct syscall number for svc. */
+        brk 0xb002 /* For now we break with a unique code. */
+        END_FUNC(dynamorio_sys_exit)
+
+        DECLARE_FUNC(new_bsdthread_intercept)
+GLOBAL_LABEL(new_bsdthread_intercept:)
+        /* TODO i#5383: Get correct syscall number for svc. */
+        brk 0xb003 /* For now we break with a unique code. */
+        END_FUNC(new_bsdthread_intercept)
+#endif
+
+#ifdef MACOS
+        DECLARE_FUNC(main_signal_handler)
+GLOBAL_LABEL(main_signal_handler:)
+        /* see sendsig_set_thread_state64 in unix_signal.c */
+        mov      ARG6, sp
+        b        GLOBAL_REF(main_signal_handler_C) /* chain call */
+        END_FUNC(main_signal_handler)
+#endif
 
         DECLARE_FUNC(hashlookup_null_handler)
 GLOBAL_LABEL(hashlookup_null_handler:)
@@ -608,8 +665,7 @@ GLOBAL_LABEL(icache_op_ic_ivau_asm:)
         /* Spill X1 and X2 to TLS_REG4_SLOT and TLS_REG5_SLOT. */
         stp      x1, x2, [x0, #spill_state_r4_OFFSET]
         /* Point X1 at icache_op_struct.lock. */
-        adrp     x1, (icache_op_struct + icache_op_struct_lock_OFFSET)
-        add      x1, x1, #:lo12:(icache_op_struct + icache_op_struct_lock_OFFSET)
+        AARCH64_ADRP_GOT((GLOBAL_REF(icache_op_struct) + icache_op_struct_lock_OFFSET), x1)
         /* Acquire lock. */
         prfm     pstl1keep, [x1]
 1:
@@ -707,8 +763,7 @@ ic_ivau_return:
         /* Load fcache_return into X1. */
         ldr      x1, [x0, #spill_state_fcache_return_OFFSET]
         /* Point X0 at fake linkstub. */
-        adrp     x0, linkstub_selfmod
-        add      x0, x0, #:lo12:linkstub_selfmod
+        AARCH64_ADRP_GOT(GLOBAL_REF(linkstub_selfmod), x0)
         /* Branch to fcache_return. */
         br       x1
 
@@ -740,8 +795,7 @@ GLOBAL_LABEL(icache_op_isb_asm:)
         ldr      x2, [x0, #spill_state_r2_OFFSET]
         stp      x1, x2, [x0, #spill_state_r4_OFFSET]
         /* Point X1 at icache_op_struct.lock. */
-        adrp     x1, (icache_op_struct + icache_op_struct_lock_OFFSET)
-        add      x1, x1, #:lo12:(icache_op_struct + icache_op_struct_lock_OFFSET)
+        AARCH64_ADRP_GOT((GLOBAL_REF(icache_op_struct) + icache_op_struct_lock_OFFSET), x1)
         /* Acquire lock. */
         prfm     pstl1keep, [x1]
 1:
@@ -768,8 +822,7 @@ GLOBAL_LABEL(icache_op_isb_asm:)
         /* Load fcache_return into X1. */
         ldr      x1, [x0, #spill_state_fcache_return_OFFSET]
         /* Point X0 at fake linkstub. */
-        adrp     x0, linkstub_selfmod
-        add      x0, x0, #:lo12:linkstub_selfmod
+        AARCH64_ADRP_GOT(GLOBAL_REF(linkstub_selfmod), x0)
         /* Branch to fcache_return. */
         br       x1
         END_FUNC(icache_op_isb_asm)

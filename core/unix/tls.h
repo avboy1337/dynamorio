@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2011-2019 Google, Inc.  All rights reserved.
+ * Copyright (c) 2011-2020 Google, Inc.  All rights reserved.
  * Copyright (c) 2008-2010 VMware, Inc.  All rights reserved.
  * **********************************************************/
 
@@ -129,7 +129,10 @@ typedef struct _our_modify_ldt_t {
 static inline ptr_uint_t
 read_thread_register(reg_id_t reg)
 {
-#if defined(MACOS64)
+#ifdef DR_HOST_NOT_TARGET
+    ptr_uint_t sel = 0;
+    ASSERT_NOT_REACHED();
+#elif defined(MACOS64) && !defined(AARCH64)
     ptr_uint_t sel;
     if (reg == SEG_GS) {
         asm volatile("mov %%gs:%1, %0" : "=r"(sel) : "m"(*(void **)0));
@@ -181,6 +184,17 @@ read_thread_register(reg_id_t reg)
         ASSERT_NOT_REACHED();
         return 0;
     }
+#elif defined(RISCV64)
+    ptr_uint_t sel;
+    if (reg == DR_REG_TP) {
+        asm volatile("mv %0, tp" : "=r"(sel));
+    } else if (reg == DR_REG_INVALID) {
+        /* FIXME i#3544: SEG_TLS is not used. See os_exports.h */
+        return 0;
+    } else {
+        ASSERT_NOT_REACHED();
+        return 0;
+    }
 #else
     ASSERT_NOT_IMPLEMENTED(false);
 #endif
@@ -191,8 +205,11 @@ read_thread_register(reg_id_t reg)
 static inline bool
 write_thread_register(void *val)
 {
-#    ifdef AARCH64
-    asm volatile("msr tpidr_el0, %0" : : "r"(val));
+#    ifdef DR_HOST_NOT_TARGET
+    ASSERT_NOT_REACHED();
+    return false;
+#    elif defined(AARCH64)
+    asm volatile("msr " IF_MACOS_ELSE("tpidrro_el0", "tpidr_el0") ", %0" : : "r"(val));
     return true;
 #    else
     return (dynamorio_syscall(SYS_set_tls, 1, val) == 0);
@@ -209,7 +226,7 @@ write_thread_register(void *val)
 
 #ifdef LINUX
 #    define GDT_NUM_TLS_SLOTS 3
-#elif defined(MACOS)
+#elif defined(MACOS) && defined(X86)
 /* XXX: rename to APP_SAVED_TLS_SLOTS or sthg?
  *
  * XXX i#1405: it seems that the kernel does not swap our entries, so

@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2016-2020 Google, Inc.  All rights reserved.
+ * Copyright (c) 2016-2022 Google, Inc.  All rights reserved.
  * **********************************************************/
 
 /*
@@ -82,8 +82,31 @@ drmemtrace_client_main(client_id_t id, int argc, const char *argv[]);
  * @param[in] mode_flags  The DR_FILE_* flags for file open.
  *
  * \return the opened file id.
+ *
+ * \note For additional parameters with the thread and window identifiers,
+ * use #drmemtrace_open_file_ex_func_t and drmemtrace_replace_file_ops_ex().
  */
-typedef file_t (*drmemtrace_open_file_func_t)(const char *fname, uint mode_flag);
+typedef file_t (*drmemtrace_open_file_func_t)(const char *fname, uint mode_flags);
+
+/**
+ * Function for extended file open.
+ * The file access mode is set by the \p mode_flags argument which is drawn from
+ * the DR_FILE_* defines ORed together.  Returns INVALID_FILE if unsuccessful.
+ * The example behavior is described in dr_open_file();
+ *
+ * @param[in] fname       The filename to open.
+ * @param[in] mode_flags  The DR_FILE_* flags for file open.
+ * @param[in] thread_id   The application thread id targeted by this file.
+ *   For special files (drmemtrace_get_modlist_path(), drmemtrace_get_funclist_path(),
+ *   drmemtrace_get_encoding_path(), or PT files), this will be 0.
+ * @param[in] window_id   The tracing window id for this file.
+ *   For special files (drmemtrace_get_modlist_path(), drmemtrace_get_funclist_path(),
+ *   drmemtrace_get_encoding_path(), or PT files), this will be -1.
+ *
+ * \return the opened file id.
+ */
+typedef file_t (*drmemtrace_open_file_ex_func_t)(const char *fname, uint mode_flags,
+                                                 thread_id_t thread_id, int64 window_id);
 
 /**
  * Function for file read.
@@ -135,10 +158,15 @@ typedef bool (*drmemtrace_create_dir_func_t)(const char *dir);
 DR_EXPORT
 /**
  * Registers functions to replace the default file operations for offline tracing.
+ * If tracing windows are used and separate files per window are not meant to
+ * be supported by "open_file_func", it is up to the user to set \p -no_split_windows.
  *
  * \note The caller is responsible for the transparency and isolation of using
  * those functions, which will be called in the middle of arbitrary
  * application code.
+ *
+ * \note For additional file open parameters with the thread and window identifiers,
+ * use drmemtrace_replace_file_ops_ex().
  */
 drmemtrace_status_t
 drmemtrace_replace_file_ops(drmemtrace_open_file_func_t open_file_func,
@@ -208,6 +236,44 @@ drmemtrace_status_t
 drmemtrace_buffer_handoff(drmemtrace_handoff_func_t handoff_func,
                           drmemtrace_exit_func_t exit_func, void *exit_func_arg);
 
+/**
+ * Structure holding all the file replacement operations for passing to
+ * drmemtrace_replace_file_ops_ex().
+ */
+typedef struct {
+    /** The user must set this to the size of the structure. */
+    size_t size;
+    /** Replacement for file opening. */
+    drmemtrace_open_file_ex_func_t open_file_ex_func;
+    /** Replacement for file reading. */
+    drmemtrace_read_file_func_t read_file_func;
+    /**
+     * Replacement for file writing.  Only one of this or \p handoff_buf should be set.
+     */
+    drmemtrace_write_file_func_t write_file_func;
+    /** Replacement for file closing. */
+    drmemtrace_close_file_func_t close_file_func;
+    /** Replacement for directory creation. */
+    drmemtrace_create_dir_func_t create_dir_func;
+    /**
+     * Replacement for file writing where a new buffer is used each time.
+     * Only one of this or \p write_file should be set.
+     * See drmemtrace_buffer_handoff().
+     */
+    drmemtrace_handoff_func_t handoff_buf_func;
+    /** Called at process exit and passed \p exit_arg. */
+    drmemtrace_exit_func_t exit_func;
+    void *exit_arg; /**< Argument to \p exit_func. */
+} drmemtrace_replace_file_ops_t;
+
+DR_EXPORT
+/**
+ * Combines drmemtrace_replace_file_ops() and drmemtrace_buffer_handoff() and
+ * provides a file open function which takes two extra parameters.
+ */
+drmemtrace_status_t
+drmemtrace_replace_file_ops_ex(drmemtrace_replace_file_ops_t *ops);
+
 DR_EXPORT
 /**
  * Retrieves the full path to the output directory in -offline mode
@@ -248,18 +314,30 @@ drmemtrace_get_funclist_path(OUT const char **path);
 
 DR_EXPORT
 /**
+ * Retrieves the full path to the file in -offline mode where
+ * non-module instruction encoding data is written.  The basename of
+ * the file is #DRMEMTRACE_ENCODING_FILENAME.  It contains binary data
+ * read by the raw2trace tool.
+ */
+drmemtrace_status_t
+drmemtrace_get_encoding_path(OUT const char **path);
+
+DR_EXPORT
+/**
  * Adds custom data stored with each module in the module list produced for
- * offline trace post-processing.  The \p load_cb is called for each new module,
+ * offline trace post-processing.  The \p load_cb is called for each segment
+ * of each new module (with \p seg_idx indicating the segment number, starting at 0),
  * and its return value is the data that is stored.  That data is later printed
  * to a string with \p print_cb, which should return the number of characters
- * printed or -1 on error.  The data is freed with \p free_cb.
+ * printed or -1 on error.  The data is freed with \p free_cb.  Each is called
+ * separately for each segment of each module.
  *
  * On the post-processing side, the user should create a custom post-processor
  * by linking with raw2trace and calling raw2trace_t::handle_custom_data() to provide
  * parsing and processing routines for the custom data.
  */
 drmemtrace_status_t
-drmemtrace_custom_module_data(void *(*load_cb)(module_data_t *module),
+drmemtrace_custom_module_data(void *(*load_cb)(module_data_t *module, int seg_idx),
                               int (*print_cb)(void *data, char *dst, size_t max_len),
                               void (*free_cb)(void *data));
 

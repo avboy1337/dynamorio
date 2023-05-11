@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2016-2020 Google, Inc.  All rights reserved.
+ * Copyright (c) 2016-2022 Google, Inc.  All rights reserved.
  * **********************************************************/
 
 /*
@@ -49,8 +49,13 @@ public:
 protected:
     bool
     create_analysis_tools();
+    bool
+    init_analysis_tools();
     void
     destroy_analysis_tools();
+
+    std::unique_ptr<std::istream> serial_schedule_file_;
+    std::unique_ptr<std::istream> cpu_schedule_file_;
 
     static const int max_num_tools_ = 8;
 };

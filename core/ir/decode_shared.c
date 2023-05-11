@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2011-2019 Google, Inc.  All rights reserved.
+ * Copyright (c) 2011-2021 Google, Inc.  All rights reserved.
  * Copyright (c) 2001-2010 VMware, Inc.  All rights reserved.
  * **********************************************************/
 
@@ -42,7 +42,7 @@
 #include "instr.h"
 #include "decode.h"
 
-#if defined(DEBUG) && defined(CLIENT_INTERFACE)
+#ifdef DEBUG
 /* case 10450: give messages to clients */
 /* we can't undef ASSERT b/c of DYNAMO_OPTION */
 #    undef ASSERT_TRUNCATE
@@ -150,6 +150,7 @@ const char *const size_names[] = {
     "OPSZ_32_of_64",
     "OPSZ_4_of_32_evex64",
     "OPSZ_8_of_32_evex64",
+    "OPSZ_8x16",
     "OPSZ_1_of_4",
     "OPSZ_2_of_4",
     "OPSZ_1_of_8",
@@ -164,7 +165,6 @@ const char *const size_names[] = {
     "OPSZ_12_rex8_of_16",
     "OPSZ_14_of_16",
     "OPSZ_15_of_16",
-    "OPSZ_8_of_16_vex32",
     "OPSZ_16_of_32",
     "OPSZ_half_16_vex32",
     "OPSZ_half_16_vex32_evex64",
@@ -172,8 +172,31 @@ const char *const size_names[] = {
     "OPSZ_quarter_16_vex32_evex64",
     "OPSZ_eighth_16_vex32",
     "OPSZ_eighth_16_vex32_evex64",
-    "OPSZ_8x16",
 };
+
+/* AArch64 Scalable Vector Extension's vector length in bits. */
+int sve_veclen;
+int sve_veclens[] = { 128,  256,  384,  512,  640,  768,  896,  1024,
+                      1152, 1280, 1408, 1536, 1664, 1792, 1920, 2048 };
+
+void
+dr_set_sve_vl(int vl)
+{
+    /* TODO i#3044: Vector length will be read from h/w when running on SVE. */
+    for (int i = 0; i < sizeof(sve_veclens); i++) {
+        if (vl == sve_veclens[i]) {
+            sve_veclen = vl;
+            return;
+        }
+    }
+    CLIENT_ASSERT(false, "invalid SVE vector length");
+}
+
+int
+dr_get_sve_vl(void)
+{
+    return sve_veclen;
+}
 
 /* point at this when you need a canonical invalid instr
  * type is OP_INVALID so can be copied to instr->opcode
@@ -197,9 +220,9 @@ static dr_isa_mode_t initexit_isa_mode = DEFAULT_ISA_MODE_STATIC;
  * mis-interpreting application code.
  */
 bool
-dr_set_isa_mode(dcontext_t *dcontext, dr_isa_mode_t new_mode,
-                dr_isa_mode_t *old_mode_out OUT)
+dr_set_isa_mode(void *drcontext, dr_isa_mode_t new_mode, dr_isa_mode_t *old_mode_out OUT)
 {
+    dcontext_t *dcontext = (dcontext_t *)drcontext;
     dr_isa_mode_t old_mode;
     /* We would disallow but some early init routines need to use global heap */
     if (dcontext == GLOBAL_DCONTEXT)
@@ -228,8 +251,9 @@ dr_set_isa_mode(dcontext_t *dcontext, dr_isa_mode_t new_mode,
  * that flag.
  */
 dr_isa_mode_t
-dr_get_isa_mode(dcontext_t *dcontext)
+dr_get_isa_mode(void *drcontext)
 {
+    dcontext_t *dcontext = (dcontext_t *)drcontext;
 #if !defined(STANDALONE_DECODER) && defined(DEBUG)
     dcontext_t *orig_dcontext = dcontext;
 #endif

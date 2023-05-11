@@ -1,6 +1,9 @@
 #if defined(AARCH64)
+ 00000000   udf    $0x0000
  f94017a0   ldr    +0x28(%x29)[8byte] -> %x0
  a9be7bfd   stp    %x29 %x30 %sp $0xffffffffffffffe0 -> -0x20(%sp)[16byte] %sp
+ e58057a1   str    %z1 -> +0x05(%x29)[32byte]
+ 85865e6b   ldr    +0x37(%x19)[32byte] -> %z11
 disassembly failed: invalid instruction: not enough bytes: 0x88
 #elif defined(ARM) && !defined(thumb)
  f2436813   vtst.8 %d3 %d3 -> %d22
@@ -12,7 +15,7 @@ disassembly failed: invalid instruction: not enough bytes: 0x88
  b2db       uxtb   %r3[1byte] -> %r3
 disassembly failed: invalid instruction: not enough bytes: 0x88
 #elif defined(X86)
- 66 90                nop
+ 66 90                data16 nop
 # ifdef X64
  c4 e2 65 90 14 80    vpgatherdd (%rax,%ymm0,4)[4byte] %ymm3 -> %ymm2 %ymm3
 # else

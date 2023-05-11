@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2013-2019 Google, Inc.  All rights reserved.
+ * Copyright (c) 2013-2022 Google, Inc.  All rights reserved.
  * Copyright (c) 2002-2010 VMware, Inc.  All rights reserved.
  * **********************************************************/
 
@@ -47,7 +47,7 @@
 #    include "../globals.h"
 #    include "arch.h"
 #    include "instr.h"
-#    include "instr_create.h"
+#    include "instr_create_shared.h"
 #    include "instrlist.h"
 #    include "decode.h"
 #    include "decode_fast.h"
@@ -143,7 +143,7 @@ void
 d_r_logtrace(dcontext_t *dcontext, uint level, instrlist_t *trace, const char *string);
 
 /****************************************************************************/
-/* master routine */
+/* main routine */
 
 void
 optimize_trace(dcontext_t *dcontext, app_pc tag, instrlist_t *trace)
@@ -2662,7 +2662,6 @@ constant_propagation(dcontext_t *dcontext, app_pc tag, instrlist_t *trace)
     opnd_t opnd, prop_opnd;
     instr_t *inst, *backup;
 
-    bool is_zeroing;
     /* FIXME: this is a data race!
      * and why set this for every trace?  options are static!
      * have some kind of optimize_init to set these
@@ -2694,7 +2693,6 @@ constant_propagation(dcontext_t *dcontext, app_pc tag, instrlist_t *trace)
     for (inst = instrlist_first(trace); inst != NULL; inst = instr_get_next(inst)) {
         /* backup in case results turns out to be unencodable */
         backup = NULL;
-        is_zeroing = false;
 
         inst = handle_stack(&state, inst);
         ASSERT(inst != NULL);

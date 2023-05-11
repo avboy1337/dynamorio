@@ -1,5 +1,5 @@
 /* ***************************************************************************
- * Copyright (c) 2012-2018 Google, Inc.  All rights reserved.
+ * Copyright (c) 2012-2023 Google, Inc.  All rights reserved.
  * ***************************************************************************/
 
 /*
@@ -139,7 +139,14 @@ bb_table_print(void *drcontext, per_thread_t *data)
         ASSERT(false, "invalid log file");
         return;
     }
-    dr_fprintf(data->log, "BB Table: %u bbs\n", drtable_num_entries(data->bb_table));
+    /* We do not support >32U-bit-max (~4 billion) blocks.
+     * drcov2lcov would need a number of changes to support this.
+     * We have a debug-build check here.
+     */
+    ASSERT(drtable_num_entries(data->bb_table) <= UINT_MAX,
+           "block count exceeds 32-bit max");
+    dr_fprintf(data->log, "BB Table: %u bbs\n",
+               (uint)drtable_num_entries(data->bb_table));
     if (TEST(DRCOVLIB_DUMP_AS_TEXT, options.flags)) {
         dr_fprintf(data->log, "module id, start, size:\n");
         drtable_iterate(data->bb_table, data, bb_table_entry_print);
@@ -152,16 +159,17 @@ bb_table_entry_add(void *drcontext, per_thread_t *data, app_pc start, uint size)
 {
     bb_entry_t *bb_entry = drtable_alloc(data->bb_table, 1, NULL);
     uint mod_id;
-    app_pc mod_start;
-    drcovlib_status_t res = drmodtrack_lookup(drcontext, start, &mod_id, &mod_start);
+    app_pc mod_seg_start;
+    drcovlib_status_t res =
+        drmodtrack_lookup_segment(drcontext, start, &mod_id, &mod_seg_start);
     /* we do not de-duplicate repeated bbs */
     ASSERT(size < USHRT_MAX, "size overflow");
     bb_entry->size = (ushort)size;
     if (res == DRCOVLIB_SUCCESS) {
         ASSERT(mod_id < USHRT_MAX, "module id overflow");
         bb_entry->mod_id = (ushort)mod_id;
-        ASSERT(start > mod_start, "wrong module");
-        bb_entry->start = (uint)(start - mod_start);
+        ASSERT(start >= mod_seg_start, "wrong module");
+        bb_entry->start = (uint)(start - mod_seg_start);
     } else {
         /* XXX: we just truncate the address, which may have wrong value
          * in x64 arch. It should be ok now since it is an unknown module,
@@ -500,6 +508,8 @@ drcovlib_exit(void)
         dump_drcov_data(NULL, global_data);
         global_data_destroy(global_data);
     }
+    drcov_per_thread = false;
+
     /* destroy module table */
     drmodtrack_exit();
 

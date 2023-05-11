@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2017-2019 Google, Inc.  All rights reserved.
+ * Copyright (c) 2017-2022 Google, Inc.  All rights reserved.
  * **********************************************************/
 
 /*
@@ -33,6 +33,7 @@
 /* Tests the drmodtrack extension. */
 
 #include "dr_api.h"
+#include "drmgr.h"
 #include "drcovlib.h"
 #include "drx.h"
 #include "client_tools.h"
@@ -44,19 +45,15 @@
 #    pragma warning(disable : 4127) /* conditional expression is constant */
 #endif
 
-#define CHECK(x, msg)                                                                \
-    do {                                                                             \
-        if (!(x)) {                                                                  \
-            dr_fprintf(STDERR, "CHECK failed %s:%d: %s\n", __FILE__, __LINE__, msg); \
-            dr_abort();                                                              \
-        }                                                                            \
-    } while (0);
-
 static client_id_t client_id;
 
 static void *
-load_cb(module_data_t *module)
+load_cb(module_data_t *module, int seg_idx)
 {
+#ifndef WINDOWS
+    if (seg_idx > 0)
+        return (void *)module->segments[seg_idx].start;
+#endif
     return (void *)module->start;
 }
 
@@ -139,6 +136,23 @@ free_alloc_cb(void *data)
     my_free(data);
 }
 
+dr_emit_flags_t
+bb_analysis(void *drcontext, void *tag, instrlist_t *bb, bool for_trace, bool translating,
+            OUT void **user_data)
+{
+    app_pc pc = dr_fragment_app_pc(tag);
+    app_pc modbase;
+    uint modidx;
+    drcovlib_status_t res = drmodtrack_lookup(drcontext, pc, &modidx, &modbase);
+    // We expect no gencode.
+    CHECK(res == DRCOVLIB_SUCCESS, "drmodtrack_lookup failed");
+    app_pc reverse_base;
+    res = drmodtrack_lookup_pc_from_index(drcontext, modidx, &reverse_base);
+    CHECK(res == DRCOVLIB_SUCCESS, "drmodtrack_lookup_pc_from_index failed");
+    CHECK(reverse_base == modbase, "drmodtrack reverse lookup mismatch");
+    return DR_EMIT_DEFAULT;
+}
+
 static void
 event_exit(void)
 {
@@ -189,21 +203,27 @@ event_exit(void)
         };
         res = drmodtrack_offline_lookup(modhandle, i, &info);
         CHECK(res == DRCOVLIB_SUCCESS, "lookup failed");
-        CHECK(((app_pc)info.custom) == info.start || info.containing_index != i,
-              "custom field doesn't match");
+        CHECK(((app_pc)info.custom) == info.start, "custom field doesn't match");
         CHECK(info.index == i, "index field doesn't match");
 #ifndef WINDOWS
-        if (info.struct_size > offsetof(drmodtrack_info_t, offset)) {
-            module_data_t *data = dr_lookup_module(info.start);
-            for (uint j = 0; j < data->num_segments; j++) {
-                module_segment_data_t *seg = data->segments + j;
-                if (seg->start == info.start) {
-                    CHECK(seg->offset == info.offset,
-                          "Module data offset and drmodtrack offset don't match");
-                }
+        module_data_t *data = dr_lookup_module(info.start);
+        for (uint j = 0; j < data->num_segments; j++) {
+            module_segment_data_t *seg = data->segments + j;
+            if (seg->start == info.start) {
+                CHECK(seg->offset == info.offset,
+                      "Module data offset and drmodtrack offset don't match");
+                drmodtrack_info_t parent = {
+                    sizeof(parent),
+                };
+                res =
+                    drmodtrack_offline_lookup(modhandle, info.containing_index, &parent);
+                CHECK(res == DRCOVLIB_SUCCESS, "lookup failed");
+                CHECK(info.preferred_base ==
+                          parent.preferred_base + (info.start - parent.start),
+                      "Segment preferred base not properly offset");
             }
-            dr_free_module_data(data);
         }
+        dr_free_module_data(data);
 #endif
     }
 
@@ -259,12 +279,17 @@ event_exit(void)
     CHECK(res == DRCOVLIB_SUCCESS, "customization failed");
     res = drmodtrack_exit();
     CHECK(res == DRCOVLIB_SUCCESS, "module exit failed");
+    drmgr_exit();
 }
 
 DR_EXPORT void
 dr_init(client_id_t id)
 {
     client_id = id;
+    bool ok = drmgr_init();
+    CHECK(ok, "drmgr_init failed");
+    ok = drmgr_register_bb_instrumentation_event(bb_analysis, nullptr, nullptr);
+    CHECK(ok, "drmgr_register_bb_instrumentation_event failed");
     drcovlib_status_t res = drmodtrack_init();
     CHECK(res == DRCOVLIB_SUCCESS, "init failed");
     res = drmodtrack_add_custom_data(load_cb, print_cb, parse_cb, free_cb);

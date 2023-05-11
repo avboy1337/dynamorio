@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2011-2019 Google, Inc.  All rights reserved.
+ * Copyright (c) 2011-2022 Google, Inc.  All rights reserved.
  * Copyright (c) 2000-2010 VMware, Inc.  All rights reserved.
  * **********************************************************/
 
@@ -57,6 +57,9 @@
 static size_t xstate_size;
 static bool xstate_has_extra_fields;
 
+/* We use this early enough during init that we assume there is no confusion
+ * with NUDGESIG_SIGNUM or SUSPEND_SIGNAL as DR's main handler is not set up yet.
+ */
 #define XSTATE_QUERY_SIG SIGILL
 
 /**** floating point support ********************************************/
@@ -262,6 +265,8 @@ save_xmm(dcontext_t *dcontext, sigframe_rt_t *frame)
          */
         uint bv_high, bv_low;
         dr_xgetbv(&bv_high, &bv_low);
+        LOG(THREAD, LOG_ASYNCH, 3, "setting xstate_bv from 0x%016lx to 0x%08x%08x\n",
+            xstate->xstate_hdr.xstate_bv, bv_high, bv_low);
         xstate->xstate_hdr.xstate_bv = (((uint64)bv_high) << 32) | bv_low;
     }
     for (i = 0; i < proc_num_simd_sse_avx_saved(); i++) {
@@ -592,6 +597,23 @@ mcontext_to_sigcontext_simd(sig_full_cxt_t *sc_full, priv_mcontext_t *mc)
                            YMMH_REG_SIZE);
                 }
             }
+            /* XXX: We've observed the kernel leaving out the AVX flag in signal
+             * contexts for DR's suspend signals, even when all app threads have used AVX
+             * instructions already
+             * (https://github.com/DynamoRIO/dynamorio/pull/5791#issuecomment-1358789851).
+             * We ensure we're setting the full state to avoid problems on detach,
+             * although we do not fully understand how the kernel can have this local
+             * laziness in AVX state.
+             */
+            uint bv_high, bv_low;
+            dr_xgetbv(&bv_high, &bv_low);
+            uint64 real_val = (((uint64)bv_high) << 32) | bv_low;
+            if (xstate->xstate_hdr.xstate_bv != real_val) {
+                LOG(THREAD_GET, LOG_ASYNCH, 3,
+                    "%s: setting xstate_bv from 0x%016lx to 0x%016lx\n", __FUNCTION__,
+                    xstate->xstate_hdr.xstate_bv, real_val);
+                xstate->xstate_hdr.xstate_bv = real_val;
+            }
         }
 #ifdef X64
         if (ZMM_ENABLED()) {
@@ -693,6 +715,13 @@ signal_arch_init(void)
          * compiler from optimizing it away.
          * XXX i#641, i#639: this breaks transparency to some extent until the
          * app uses fpu/xmm but we live with it.
+         * Given a security vulnerability and its mitigations, executing a fpu/xmm
+         * operation here might not be necessary anymore. The vulnerabilty, published on
+         * June 13, 2018, is CVE-2018-3665: "Lazy FPU Restore" schemes are vulnerable to
+         * the FPU state information leakage issue. The kernel-based mitigation was to
+         * automatically default to (safe) "eager" floating point register restore.  In
+         * this mode FPU state is saved and restored for every task/context switch
+         * regardless of whether the current process invokes FPU instructions or not.
          */
         __asm__ __volatile__("movd %%xmm0, %0" : "=g"(rc));
         memset(&act, 0, sizeof(act));

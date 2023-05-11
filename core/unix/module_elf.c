@@ -1,5 +1,5 @@
 /* *******************************************************************************
- * Copyright (c) 2012-2020 Google, Inc.  All rights reserved.
+ * Copyright (c) 2012-2022 Google, Inc.  All rights reserved.
  * Copyright (c) 2011 Massachusetts Institute of Technology  All rights reserved.
  * Copyright (c) 2008-2010 VMware, Inc.  All rights reserved.
  * *******************************************************************************/
@@ -60,7 +60,6 @@ typedef uint32_t Elf_Symndx;
 #    define STN_UNDEF 0
 #endif
 
-#ifdef CLIENT_INTERFACE
 typedef struct _elf_symbol_iterator_t {
     dr_symbol_import_t symbol_import; /* symbol import returned by next() */
     dr_symbol_export_t symbol_export; /* symbol export returned by next() */
@@ -88,7 +87,6 @@ typedef struct _elf_symbol_iterator_t {
     Elf_Symndx hidx;
     Elf_Symndx chain_idx;
 } elf_symbol_iterator_t;
-#endif /* CLIENT_INTERFACE */
 
 /* In case want to build w/o gnu headers and use that to run recent gnu elf */
 #ifndef DT_GNU_HASH
@@ -309,7 +307,13 @@ module_fill_os_data(ELF_PROGRAM_HEADER_TYPE *prog_hdr, /* PT_DYNAMIC entry */
 
                 /* test string readability while still in try/except
                  * in case we screwed up somewhere or module is
-                 * malformed/only partially mapped */
+                 * malformed/only partially mapped.
+                 *
+                 * i#3385: strlen fails here in case when .dynstr is
+                 * placed in the end of segment (thus soname is not mapped
+                 * at the moment). We'll try to re-init module data again
+                 * in instrument_module_load_trigger() at first execution.
+                 */
                 if (*soname != NULL && strlen(*soname) == -1) {
                     ASSERT_NOT_REACHED();
                 }
@@ -963,6 +967,8 @@ module_init_os_privmod_data_from_dyn(os_privmod_data_t *opd, ELF_DYNAMIC_ENTRY_T
         case DT_RELA: opd->rela = (ELF_RELA_TYPE *)(dyn->d_un.d_ptr + load_delta); break;
         case DT_RELASZ: opd->relasz = (size_t)dyn->d_un.d_val; break;
         case DT_RELAENT: opd->relaent = (size_t)dyn->d_un.d_val; break;
+        case DT_RELRSZ: opd->relrsz = (size_t)dyn->d_un.d_val; break;
+        case DT_RELR: opd->relr = (ELF_WORD *)(dyn->d_un.d_ptr + load_delta); break;
         case DT_VERNEED: opd->verneed = (app_pc)(dyn->d_un.d_ptr + load_delta); break;
         case DT_VERNEEDNUM: opd->verneednum = dyn->d_un.d_val; break;
         case DT_VERSYM: opd->versym = (ELF_HALF *)(dyn->d_un.d_ptr + load_delta); break;
@@ -1051,6 +1057,7 @@ module_get_os_privmod_data(app_pc base, size_t size, bool dyn_reloc,
                                           DR_DISALLOW_UNSAFE_STATIC_NAME, NULL) != NULL)
             disallow_unsafe_static_calls = true;
     });
+    pd->use_app_imports = false;
 }
 
 /* Returns a pointer to the phdr of the given type.
@@ -1107,12 +1114,12 @@ module_lookup_symbol(ELF_SYM_TYPE *sym, os_privmod_data_t *pd)
     res = get_proc_address_from_os_data(&pd->os_data, pd->load_delta, name, &is_ifunc);
     if (res != NULL) {
         if (is_ifunc) {
-            TRY_EXCEPT_ALLOW_NO_DCONTEXT(dcontext, { res = ((app_pc(*)(void))(res))(); },
-                                         { /* EXCEPT */
-                                           ASSERT_CURIOSITY(
-                                               false && "crashed while executing ifunc");
-                                           res = NULL;
-                                         });
+            TRY_EXCEPT_ALLOW_NO_DCONTEXT(
+                dcontext, { res = ((app_pc(*)(void))(res))(); },
+                { /* EXCEPT */
+                  ASSERT_CURIOSITY(false && "crashed while executing ifunc");
+                  res = NULL;
+                });
         }
         return res;
     }
@@ -1129,10 +1136,27 @@ module_lookup_symbol(ELF_SYM_TYPE *sym, os_privmod_data_t *pd)
     while (mod != NULL) {
         pd = mod->os_privmod_data;
         ASSERT(pd != NULL && name != NULL);
-        LOG(GLOBAL, LOG_LOADER, 3, "sym lookup for %s from %s = %s\n", name, pd->soname,
-            mod->path);
-        res =
-            get_proc_address_from_os_data(&pd->os_data, pd->load_delta, name, &is_ifunc);
+
+        if (pd->soname != NULL) {
+            LOG(GLOBAL, LOG_LOADER, 3, "sym lookup for %s from %s = %s\n", name,
+                pd->soname, mod->path);
+        } else {
+            LOG(GLOBAL, LOG_LOADER, 3, "sym lookup for %s from %s = %s\n", name, "NULL",
+                mod->path);
+        }
+
+        /* XXX i#956: A private libpthread is not fully supported.  For now we let
+         * it load but avoid using any symbols like __errno_location as those
+         * cause crashes: prefer the libc version.
+         */
+        if (pd->soname != NULL && strstr(pd->soname, "libpthread") == pd->soname &&
+            strstr(name, "pthread") != name) {
+            LOG(GLOBAL, LOG_LOADER, 3, "NOT using libpthread's non-pthread symbol\n");
+            res = NULL;
+        } else {
+            res = get_proc_address_from_os_data(&pd->os_data, pd->load_delta, name,
+                                                &is_ifunc);
+        }
         if (res != NULL) {
             if (is_ifunc) {
                 TRY_EXCEPT_ALLOW_NO_DCONTEXT(
@@ -1154,8 +1178,6 @@ module_undef_symbols()
 {
     FATAL_USAGE_ERROR(UNDEFINED_SYMBOL_REFERENCE, 0, "");
 }
-
-#ifdef CLIENT_INTERFACE
 
 static ELF_SYM_TYPE *
 symbol_iterator_cur_symbol(elf_symbol_iterator_t *iter)
@@ -1397,14 +1419,14 @@ dr_symbol_export_iterator_stop(dr_symbol_export_iterator_t *dr_iter)
     symbol_iterator_stop((elf_symbol_iterator_t *)dr_iter);
 }
 
-#endif /* CLIENT_INTERFACE */
-
 #ifndef ANDROID
 
-#    ifdef AARCH64
+#    if defined(AARCH64) && !defined(DR_HOST_NOT_TARGET)
 /* Defined in aarch64.asm. */
 ptr_int_t
 tlsdesc_resolver(struct tlsdesc_t *);
+#    elif defined(RISCV64)
+/* RISC-V does not use TLS descriptors. */
 #    else
 static ptr_int_t
 tlsdesc_resolver(struct tlsdesc_t *arg)
@@ -1451,6 +1473,9 @@ module_relocate_symbol(ELF_REL_TYPE *rel, os_privmod_data_t *pd, bool is_rela)
                       (byte *)r_addr >= (byte *)pd->dyn + pd->dynsz) &&
                      ".so has relocation inside PT_DYNAMIC section");
     r_type = (uint)ELF_R_TYPE(rel->r_info);
+
+    LOG(GLOBAL, LOG_LOADER, 5, "%s: reloc @ %p type=%d\n", r_addr, r_type);
+
     /* handle the most common case, i.e. ELF_R_RELATIVE */
     if (r_type == ELF_R_RELATIVE) {
         if (is_rela)
@@ -1465,10 +1490,8 @@ module_relocate_symbol(ELF_REL_TYPE *rel, os_privmod_data_t *pd, bool is_rela)
     sym = &((ELF_SYM_TYPE *)pd->os_data.dynsym)[r_sym];
     name = (char *)pd->os_data.dynstr + sym->st_name;
 
-#ifdef CLIENT_INTERFACE
-    if (INTERNAL_OPTION(private_loader) && privload_redirect_sym(r_addr, name))
+    if (INTERNAL_OPTION(private_loader) && privload_redirect_sym(pd, r_addr, name))
         return;
-#endif
 
     resolved = true;
     /* handle syms that do not need symbol lookup */
@@ -1491,6 +1514,7 @@ module_relocate_symbol(ELF_REL_TYPE *rel, os_privmod_data_t *pd, bool is_rela)
             *r_addr = sym->st_value + addend;
         break;
 #ifndef ANDROID
+#    ifndef RISCV64 /* RISCV64 does not use TLS descriptors */
     case ELF_R_TLS_DESC: {
         /* Provided the client does not invoke dr_load_aux_library after the
          * app has started and might have called clone, TLS descriptors can be
@@ -1502,6 +1526,7 @@ module_relocate_symbol(ELF_REL_TYPE *rel, os_privmod_data_t *pd, bool is_rela)
         tlsdesc->arg = (void *)(sym->st_value + addend - pd->tls_offset);
         break;
     }
+#    endif
 #    ifndef X64
     case R_386_TLS_TPOFF32:
         /* offset is positive, backward from the thread pointer */
@@ -1534,13 +1559,16 @@ module_relocate_symbol(ELF_REL_TYPE *rel, os_privmod_data_t *pd, bool is_rela)
          * libgcc_s.so.1: undefined symbol pthread_cancel
          * libstdc++.so.6: undefined symbol pthread_cancel
          */
-        SYSLOG(SYSLOG_WARNING, UNDEFINED_SYMBOL, 2, pd->soname, name);
+        const char *soname = pd->soname == NULL ? "<empty soname>" : pd->soname;
+        SYSLOG(SYSLOG_WARNING, UNDEFINED_SYMBOL, 2, soname, name);
         if (r_type == ELF_R_JUMP_SLOT)
             *r_addr = (reg_t)module_undef_symbols;
         return;
     }
     switch (r_type) {
+#ifndef RISCV64 /* FIXME i#3544: Check whether ELF_R_DIRECT with !is_rela is OK */
     case ELF_R_GLOB_DAT:
+#endif
     case ELF_R_JUMP_SLOT: *r_addr = (reg_t)res + addend; break;
     case ELF_R_DIRECT: *r_addr = (reg_t)res + (is_rela ? addend : *r_addr); break;
     case ELF_R_COPY:
@@ -1577,6 +1605,7 @@ module_relocate_rel(app_pc modbase, os_privmod_data_t *pd, ELF_REL_TYPE *start,
 {
     ELF_REL_TYPE *rel;
 
+    LOG(GLOBAL, LOG_LOADER, 4, "%s walking rel %p-%p\n", __FUNCTION__, start, end);
     for (rel = start; rel < end; rel++)
         module_relocate_symbol(rel, pd, false);
 }
@@ -1591,6 +1620,34 @@ module_relocate_rela(app_pc modbase, os_privmod_data_t *pd, ELF_RELA_TYPE *start
 {
     ELF_RELA_TYPE *rela;
 
+    LOG(GLOBAL, LOG_LOADER, 4, "%s walking rela %p-%p\n", __FUNCTION__, start, end);
     for (rela = start; rela < end; rela++)
         module_relocate_symbol((ELF_REL_TYPE *)rela, pd, true);
+}
+
+void
+/* This routine is duplicated in privload_relocate_relr for relocating
+ * dynamorio symbols in a bootstrap stage. Any update here should be also
+ * updated in privload_relocate_relr.
+ */
+module_relocate_relr(app_pc modbase, os_privmod_data_t *pd, const ELF_WORD *relr,
+                     size_t size)
+{
+    ELF_ADDR *r_addr = NULL;
+
+    LOG(GLOBAL, LOG_LOADER, 4, "%s walking relr %p-%p\n", __FUNCTION__, relr,
+        (char *)relr + size);
+    for (; size != 0; relr++, size -= sizeof(ELF_WORD)) {
+        if (!TEST(1, relr[0])) {
+            r_addr = (ELF_ADDR *)(relr[0] + pd->load_delta);
+            *r_addr++ += pd->load_delta;
+        } else {
+            int i = 0;
+            for (ELF_WORD bitmap = relr[0]; (bitmap >>= 1) != 0; i++) {
+                if (TEST(1, bitmap))
+                    r_addr[i] += pd->load_delta;
+            }
+            r_addr += CHAR_BIT * sizeof(ELF_WORD) - 1;
+        }
+    }
 }

@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2011-2019 Google, Inc.  All rights reserved.
+ * Copyright (c) 2011-2022 Google, Inc.  All rights reserved.
  * Copyright (c) 2010 VMware, Inc.  All rights reserved.
  * **********************************************************/
 
@@ -125,17 +125,17 @@ DECLARE_NEVERPROT_VAR(static int infolevel, VERBOSE);
 
 /* we store values for each of these vars: */
 static const char *const config_var[] = {
-    DYNAMORIO_VAR_HOME,       DYNAMORIO_VAR_LOGDIR,       DYNAMORIO_VAR_OPTIONS,
-    DYNAMORIO_VAR_AUTOINJECT, DYNAMORIO_VAR_UNSUPPORTED,  DYNAMORIO_VAR_RUNUNDER,
-    DYNAMORIO_VAR_CMDLINE,    DYNAMORIO_VAR_ONCRASH,      DYNAMORIO_VAR_SAFEMARKER,
-    DYNAMORIO_VAR_CACHE_ROOT, DYNAMORIO_VAR_CACHE_SHARED,
+    DYNAMORIO_VAR_HOME,       DYNAMORIO_VAR_LOGDIR,     DYNAMORIO_VAR_OPTIONS,
+    DYNAMORIO_VAR_AUTOINJECT, DYNAMORIO_VAR_ALTINJECT,  DYNAMORIO_VAR_UNSUPPORTED,
+    DYNAMORIO_VAR_RUNUNDER,   DYNAMORIO_VAR_CMDLINE,    DYNAMORIO_VAR_ONCRASH,
+    DYNAMORIO_VAR_SAFEMARKER, DYNAMORIO_VAR_CACHE_ROOT, DYNAMORIO_VAR_CACHE_SHARED,
 };
 #    ifdef WINDOWS
 static const wchar_t *const w_config_var[] = {
-    L_DYNAMORIO_VAR_HOME,       L_DYNAMORIO_VAR_LOGDIR,       L_DYNAMORIO_VAR_OPTIONS,
-    L_DYNAMORIO_VAR_AUTOINJECT, L_DYNAMORIO_VAR_UNSUPPORTED,  L_DYNAMORIO_VAR_RUNUNDER,
-    L_DYNAMORIO_VAR_CMDLINE,    L_DYNAMORIO_VAR_ONCRASH,      L_DYNAMORIO_VAR_SAFEMARKER,
-    L_DYNAMORIO_VAR_CACHE_ROOT, L_DYNAMORIO_VAR_CACHE_SHARED,
+    L_DYNAMORIO_VAR_HOME,       L_DYNAMORIO_VAR_LOGDIR,     L_DYNAMORIO_VAR_OPTIONS,
+    L_DYNAMORIO_VAR_AUTOINJECT, L_DYNAMORIO_VAR_ALTINJECT,  L_DYNAMORIO_VAR_UNSUPPORTED,
+    L_DYNAMORIO_VAR_RUNUNDER,   L_DYNAMORIO_VAR_CMDLINE,    L_DYNAMORIO_VAR_ONCRASH,
+    L_DYNAMORIO_VAR_SAFEMARKER, L_DYNAMORIO_VAR_CACHE_ROOT, L_DYNAMORIO_VAR_CACHE_SHARED,
 };
 #    endif
 #    define NUM_CONFIG_VAR (sizeof(config_var) / sizeof(config_var[0]))
@@ -624,21 +624,12 @@ d_r_config_init(void)
     config.u.v = &myvals;
     config_read(&config, NULL, 0, CFG_SFX);
     config_initialized = true;
+}
 
-#    ifndef NOT_DYNAMORIO_CORE_PROPER
-    /* i#1271: to avoid leaving a stale 1config file behind if this process
-     * crashes w/o a clean exit, we give up on re-reading the file and delete
-     * it now.  It's an anonymous file anyway and not meant for manual updates.
-     * The user could override the dynamic_options by re-specifying in
-     * the option string, if desired, and re-create the 1config manually.
-     */
-    if (config.has_1config) {
-        INFO(2, "deleting config file %s", config.fname_app);
-        os_delete_file(config.fname_app);
-        dynamo_options.dynamic_options = false;
-    }
-    /* we ignore otherarch having 1config */
-#    endif
+bool
+d_r_config_initialized(void)
+{
+    return config_initialized;
 }
 
 #    ifndef NOT_DYNAMORIO_CORE_PROPER
@@ -652,6 +643,21 @@ config_heap_init(void)
                                                                 HEAPACCT(ACCT_OTHER));
     config_reread_vals = (config_vals_t *)global_heap_alloc(sizeof(*config_reread_vals)
                                                                 HEAPACCT(ACCT_OTHER));
+
+    /* i#1271: to avoid leaving a stale 1config file behind if this process
+     * crashes w/o a clean exit, we give up on re-reading the file and delete
+     * it now.  It's an anonymous file anyway and not meant for manual updates.
+     * The user could override the dynamic_options by re-specifying in
+     * the option string, if desired, and re-create the 1config manually.
+     * We do this here and not in d_r_config_init() so we can re-read it
+     * after reload_dynamorio() in privload_early_inject().
+     */
+    if (config.has_1config) {
+        INFO(2, "deleting config file %s", config.fname_app);
+        os_delete_file(config.fname_app);
+        dynamo_options.dynamic_options = false;
+    }
+    /* we ignore otherarch having 1config */
 }
 
 void

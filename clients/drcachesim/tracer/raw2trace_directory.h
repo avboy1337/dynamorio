@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2017-2020 Google, Inc.  All rights reserved.
+ * Copyright (c) 2017-2022 Google, Inc.  All rights reserved.
  * **********************************************************/
 
 /*
@@ -38,11 +38,13 @@
 #include <vector>
 
 #include "dr_api.h"
+#include "archive_ostream.h"
 
 class raw2trace_directory_t {
 public:
     raw2trace_directory_t(unsigned int verbosity = 0)
         : modfile_bytes_(nullptr)
+        , encoding_file_(INVALID_FILE)
         , modfile_(INVALID_FILE)
         , indir_("")
         , outdir_("")
@@ -72,9 +74,19 @@ public:
     static std::string
     tracedir_from_rawdir(const std::string &rawdir);
 
+    static std::string
+    window_subdir_if_present(const std::string &dir);
+
+    static bool
+    is_window_subdir(const std::string &dir);
+
     char *modfile_bytes_;
+    file_t encoding_file_;
     std::vector<std::istream *> in_files_;
     std::vector<std::ostream *> out_files_;
+    std::vector<archive_ostream_t *> out_archives_;
+    std::ostream *serial_schedule_file_ = nullptr;
+    archive_ostream_t *cpu_schedule_file_ = nullptr;
 
 private:
     std::string
@@ -83,6 +95,10 @@ private:
     open_thread_files();
     std::string
     open_thread_log_file(const char *basename);
+    std::string
+    open_serial_schedule_file();
+    std::string
+    open_cpu_schedule_file();
     file_t modfile_;
     std::string indir_;
     std::string outdir_;

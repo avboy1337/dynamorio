@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2011-2019 Google, Inc.  All rights reserved.
+ * Copyright (c) 2011-2021 Google, Inc.  All rights reserved.
  * Copyright (c) 2008-2010 VMware, Inc.  All rights reserved.
  * **********************************************************/
 
@@ -37,9 +37,15 @@
 #include <elf.h> /* for ELF types */
 #include "../module_shared.h"
 
+#ifndef DT_RELRSZ
+#    define DT_RELRSZ 35
+#    define DT_RELR 36
+#endif
+
 /* XXX i#1345: support mixed-mode 32-bit and 64-bit in one process.
  * There is no official support for that on Linux or Mac and for now we do
  * not support it either, especially not mixing libraries.
+ * Update: We want this for i#1684 for multi-arch support in drdecode.
  */
 #ifdef X64
 #    define ELF_HEADER_TYPE Elf64_Ehdr
@@ -190,7 +196,38 @@
                             * offset for the symbol.      \
                             */
 #    endif                 /* ANDROID */
-#endif                     /* X86/ARM */
+#elif defined(RISCV64)
+#    define ELF_R_TYPE ELF64_R_TYPE
+#    define ELF_R_SYM ELF64_R_SYM
+/* relocation type */
+#    define ELF_R_NONE R_RISCV_NONE               /* No relocation. */
+#    define ELF_R_DIRECT R_RISCV_64               /* Direct 64 bit. */
+#    define ELF_R_COPY R_RISCV_COPY               /* Copy symbol at runtime. */
+/* FIXME i#3544: GOT and direct 64 bit both use R_RISCV_64. */
+#    define ELF_R_GLOB_DAT R_RISCV_64             /* Create GOT entry. */
+#    define ELF_R_JUMP_SLOT R_RISCV_JUMP_SLOT     /* Create PLT entry. */
+#    define ELF_R_RELATIVE R_RISCV_RELATIVE       /* Adjust by program base. */
+/* FIXME i#3544: R_RISCV_IRELATIVE was added after libc 2.31 and some distros
+ * don't have it yet (i.e. Ubuntu 20.04). The official number has been defined
+ * here: https://github.com/riscv/riscv-elf-psabi-doc/commit/d21ca40a.
+ */
+#    ifndef R_RISCV_IRELATIVE
+#        define R_RISCV_IRELATIVE 58
+#    endif
+#    define ELF_R_IRELATIVE R_RISCV_IRELATIVE     /* STT_GNU_IFUNC relocation. */
+/* tls related */
+#    define ELF_R_TLS_DTPMOD R_RISCV_TLS_DTPMOD64 /* Module ID. */
+#    define ELF_R_TLS_TPOFF R_RISCV_TLS_TPREL64   /* TP-relative offset. */
+#    define ELF_R_TLS_DTPOFF R_RISCV_TLS_DTPREL64 /* Module-relative offset. */
+#endif                                            /* X86/ARM/RISCV64 */
+
+/* Define ARM ELF machine types to support compiling on old Linux distros. */
+#ifndef EM_ARM
+#    define EM_ARM 40
+#endif
+#ifndef EM_AARCH64
+#    define EM_AARCH64 183
+#endif
 
 bool
 get_elf_platform(file_t f, dr_platform_t *platform);
@@ -221,6 +258,10 @@ module_relocate_rel(app_pc modbase, os_privmod_data_t *pd, ELF_REL_TYPE *start,
 void
 module_relocate_rela(app_pc modbase, os_privmod_data_t *pd, ELF_RELA_TYPE *start,
                      ELF_RELA_TYPE *end);
+
+void
+module_relocate_relr(app_pc modbase, os_privmod_data_t *pd, const ELF_WORD *relr,
+                     size_t size);
 
 bool
 module_get_relro(app_pc base, OUT app_pc *relro_base, OUT size_t *relro_size);
@@ -259,6 +300,7 @@ typedef byte *(*map_fn_t)(file_t f, size_t *size INOUT, uint64 offs, app_pc addr
 typedef bool (*unmap_fn_t)(byte *map, size_t size);
 typedef bool (*prot_fn_t)(byte *map, size_t size, uint prot /*MEMPROT_*/);
 typedef void (*check_bounds_fn_t)(elf_loader_t *elf, byte *start, byte *end);
+typedef void *(*memset_fn_t)(void *dst, int val, size_t size);
 
 /* Initialized an ELF loader for use with the given file. */
 bool
@@ -299,7 +341,8 @@ elf_loader_map_file(elf_loader_t *elf, bool reachable);
 app_pc
 elf_loader_map_phdrs(elf_loader_t *elf, bool fixed, map_fn_t map_func,
                      unmap_fn_t unmap_func, prot_fn_t prot_func,
-                     check_bounds_fn_t check_bounds_func, modload_flags_t flags);
+                     check_bounds_fn_t check_bounds_func, memset_fn_t memset_func,
+                     modload_flags_t flags);
 
 /* Iterate program headers of a mapped ELF image and find the string that
  * PT_INTERP points to.  Typically this comes early in the file and is always

@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2013-2018 Google, Inc.  All rights reserved.
+ * Copyright (c) 2013-2022 Google, Inc.  All rights reserved.
  * Copyright (c) 2005-2010 VMware, Inc.  All rights reserved.
  * **********************************************************/
 
@@ -453,7 +453,7 @@ nolibc_memset(void *dst, int val, size_t size)
     size_t i;
     char *buf = (char *)dst;
     for (i = 0; i < size; i++) {
-        buf[i] = (char)val;
+        buf[i] = (sbyte)val;
     }
 }
 
@@ -564,35 +564,72 @@ GLOBAL_LABEL(code_self_mod:)
         sub      w1, w1, #1
         cbnz     w1, repeat1
         ret
+#elif defined(RISCV64)
+        /* TODO i#3544: Port tests to RISC-V64 */
+        ret
 #else
 # error NYI
 #endif
         END_FUNC(code_self_mod)
 
 #undef FUNCNAME
+#define FUNCNAME icache_sync
+        DECLARE_FUNC(FUNCNAME)
+GLOBAL_LABEL(FUNCNAME:)
+#ifdef X86
+        /* Nothing to do. */
+        ret
+#elif defined(ARM)
+        mov      r0, ARG1     /* start of region to flush */
+        add      r1, r0, #64  /* end of region to flush */
+        mov      r2, #0       /* flags: must be 0 */
+        push     {r7}
+        movw     r7, #0x0002  /* SYS_cacheflush bottom half */
+        movt     r7, #0x000f  /* SYS_cacheflush top half */
+        svc      #0           /* flush icache */
+        pop      {r7}
+        bx       lr
+#elif defined(AARCH64)
+        mov      x0, ARG1
+        dc       cvau, x0  /* Data Cache Clean by VA to PoU */
+        dsb      ish       /* Data Synchronization Barrier, Inner Shareable */
+        ic       ivau, x0  /* Instruction Cache Invalidate by VA to PoU */
+        dsb      ish       /* Data Synchronization Barrier, Inner Shareable */
+        isb                /* Instruction Synchronization Barrier */
+        RETURN
+#endif
+        END_FUNC(FUNCNAME)
+
+#undef FUNCNAME
 #define FUNCNAME code_inc
         DECLARE_FUNC(FUNCNAME)
 GLOBAL_LABEL(FUNCNAME:)
+#if !defined(RISCV64) /* TODO i#3544: Port tests to RISC-V 64 */
         mov      REG_SCRATCH0, ARG1
         INC(REG_SCRATCH0)
         RETURN
+#endif
         END_FUNC(FUNCNAME)
 
 #undef FUNCNAME
 #define FUNCNAME code_dec
         DECLARE_FUNC(FUNCNAME)
 GLOBAL_LABEL(FUNCNAME:)
+#if !defined(RISCV64) /* TODO i#3544: Port tests to RISC-V 64 */
         mov      REG_SCRATCH0, ARG1
         DEC(REG_SCRATCH0)
         RETURN
+#endif
         END_FUNC(FUNCNAME)
 
 #undef FUNCNAME
 #define FUNCNAME dummy
         DECLARE_FUNC(FUNCNAME)
 GLOBAL_LABEL(FUNCNAME:)
+#if !defined(RISCV64) /* TODO i#3544: Port tests to RISC-V 64 */
         mov      REG_SCRATCH0, HEX(1)
         RETURN
+#endif
         END_FUNC(FUNCNAME)
 
 #undef FUNCNAME
@@ -618,6 +655,9 @@ GLOBAL_LABEL(FUNCNAME:)
         blr      x30                 /* Call function, with &retaddr as arg1. */
         ldp      x29, x30, [sp], #16
         ret                          /* Return to possibly modified return address. */
+#elif defined(RISCV64)
+        /* TODO i#3544: Port tests to RISC-V 64 */
+        ret
 #else
 # error NYI
 #endif
@@ -639,6 +679,9 @@ GLOBAL_LABEL(FUNCNAME:)
         mov      x9, x0              /* Move function pointer to scratch register. */
         mov      x0, x30             /* Replace first argument with return address. */
         br       x9                  /* Tailcall to function pointer. */
+#elif defined(RISCV64)
+        /* TODO i#3544: Port tests to RISC-V64 */
+        ret
 #else
 # error NYI
 #endif

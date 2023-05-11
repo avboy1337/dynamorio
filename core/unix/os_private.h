@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2011-2020 Google, Inc.  All rights reserved.
+ * Copyright (c) 2011-2022 Google, Inc.  All rights reserved.
  * Copyright (c) 2008-2010 VMware, Inc.  All rights reserved.
  * **********************************************************/
 
@@ -51,8 +51,8 @@
 #include "../drlibc/drlibc_unix.h"
 
 /* for inline asm */
-#ifdef X86
-#    ifdef X64
+#ifdef DR_HOST_X86
+#    ifdef DR_HOST_X64
 #        define ASM_XAX "rax"
 #        define ASM_XCX "rcx"
 #        define ASM_XDX "rdx"
@@ -66,23 +66,29 @@
 #        define ASM_XBP "ebp"
 #        define ASM_XSP "esp"
 #    endif /* 64/32-bit */
-#elif defined(AARCH64)
+#elif defined(DR_HOST_AARCH64)
 #    define ASM_R0 "x0"
 #    define ASM_R1 "x1"
-#    define ASM_XSP "sp"
+#    define ASM_R2 "x2"
+#    define ASM_R3 "x3"
 #    define ASM_XSP "sp"
 #    define ASM_INDJMP "br"
-#elif defined(ARM)
+#elif defined(DR_HOST_ARM)
 #    define ASM_R0 "r0"
 #    define ASM_R1 "r1"
+#    define ASM_R2 "r2"
+#    define ASM_R3 "r3"
 #    define ASM_XSP "sp"
 #    define ASM_INDJMP "bx"
 #endif /* X86/ARM */
 
 #define MACHINE_TLS_IS_DR_TLS IF_X86_ELSE(INTERNAL_OPTION(mangle_app_seg), true)
 
-/* PR 212090: the signal we use to suspend threads */
-#define SUSPEND_SIGNAL SIGUSR2
+/* The signal we use to suspend threads.
+ * It may equal NUDGESIG_SIGNUM.
+ */
+extern int suspend_signum;
+#define SUSPEND_SIGNAL suspend_signum
 
 #ifdef MACOS
 /* While there is no clone system call, we use the same clone flags to share
@@ -108,6 +114,10 @@
      CLONE_SETTLS | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID)
 
 #define SYSCALL_PARAM_CLONE_STACK 1
+
+#define SYSCALL_PARAM_CLONE3_CLONE_ARGS 0
+#define SYSCALL_PARAM_CLONE3_CLONE_ARGS_SIZE 1
+#define CLONE3_FLAGS_4_BYTE_MASK 0x00000000ffffffffUL
 
 struct _os_local_state_t;
 
@@ -262,6 +272,9 @@ os_walk_address_space(memquery_iter_t *iter, bool add_modules);
 bool
 is_sigreturn_syscall_number(int sysnum);
 
+bool
+is_sigqueue_supported(void);
+
 /* in signal.c */
 struct _kernel_sigaction_t;
 typedef struct _kernel_sigaction_t kernel_sigaction_t;
@@ -302,7 +315,7 @@ signal_reinstate_handlers(dcontext_t *dcontext, bool ignore_alarm);
 void
 signal_reinstate_alarm_handlers(dcontext_t *dcontext);
 void
-handle_clone(dcontext_t *dcontext, uint flags);
+handle_clone(dcontext_t *dcontext, uint64 flags);
 /* If returns false to skip the syscall, the result is in "result". */
 bool
 handle_sigaction(dcontext_t *dcontext, int sig, const kernel_sigaction_t *act,
@@ -343,8 +356,8 @@ handle_sigaltstack(dcontext_t *dcontext, const stack_t *stack, stack_t *old_stac
 
 bool
 handle_sigprocmask(dcontext_t *dcontext, int how, kernel_sigset_t *set,
-                   kernel_sigset_t *oset, size_t sigsetsize);
-void
+                   kernel_sigset_t *oset, size_t sigsetsize, uint *error_code);
+int
 handle_post_sigprocmask(dcontext_t *dcontext, int how, kernel_sigset_t *set,
                         kernel_sigset_t *oset, size_t sigsetsize);
 void
@@ -388,6 +401,9 @@ os_terminate_via_signal(dcontext_t *dcontext, terminate_flags_t flags, int sig);
 bool
 thread_signal(process_id_t pid, thread_id_t tid, int signum);
 
+bool
+thread_signal_queue(process_id_t pid, thread_id_t tid, int signum, void *value);
+
 void
 start_itimer(dcontext_t *dcontext);
 void
@@ -414,6 +430,13 @@ handle_post_alarm(dcontext_t *dcontext, bool success, unsigned int sec);
 void
 set_clone_record_fields(void *record, reg_t app_thread_xsp, app_pc continuation_pc,
                         uint clone_sysnum, uint clone_flags);
+
+#ifdef ARM
+dr_isa_mode_t
+get_sigcontext_isa_mode(sig_full_cxt_t *sc_full);
+void
+set_sigcontext_isa_mode(sig_full_cxt_t *sc_full, dr_isa_mode_t isa_mode);
+#endif
 
 /* in pcprofile.c */
 void
@@ -442,7 +465,7 @@ init_android_version(void);
 
 /* in nudgesig.c */
 bool
-create_nudge_signal_payload(kernel_siginfo_t *info OUT, uint action_mask,
+create_nudge_signal_payload(kernel_siginfo_t *info OUT, uint action_mask, uint flags,
                             client_id_t client_id, uint64 client_arg);
 
 #ifdef X86

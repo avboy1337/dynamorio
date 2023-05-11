@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2015-2020 Google, Inc.  All rights reserved.
+ * Copyright (c) 2015-2023 Google, Inc.  All rights reserved.
  * **********************************************************/
 
 /*
@@ -48,23 +48,17 @@ public:
     ipc_reader_t();
     ipc_reader_t(const char *ipc_name, int verbosity);
     virtual ~ipc_reader_t();
-    bool operator!() override;
+    bool
+    operator!() override;
     // This potentially blocks.
     bool
     init() override;
     std::string
-    get_pipe_name() const;
+    get_stream_name() const override;
 
 protected:
     trace_entry_t *
     read_next_entry() override;
-
-    bool
-    read_next_thread_entry(size_t, trace_entry_t *, bool *) override
-    {
-        // Only an interleaved stream is supported.
-        return false;
-    }
 
 private:
     named_pipe_t pipe_;

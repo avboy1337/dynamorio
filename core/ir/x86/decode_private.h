@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2011-2020 Google, Inc.  All rights reserved.
+ * Copyright (c) 2011-2022 Google, Inc.  All rights reserved.
  * Copyright (c) 2000-2010 VMware, Inc.  All rights reserved.
  * **********************************************************/
 
@@ -144,6 +144,8 @@ enum {
  * 2nd = 2nd byte of opcode (if there are 2)
  * 3rd (ls) = split into nibbles
  *   1st nibble (ms) = if bit 1 (OPCODE_TWOBYTES) set, opcode has 2 bytes
+ *                       if REQUIRES_EVEX then this bit instead means that this
+ *                       instruction must have evex.b set
  *                     if bit 2 (OPCODE_REG) set, opcode has /n
  *                     if bit 3 (OPCODE_MODRM) set, opcode based on entire modrm
  *                       that modrm is stored as the byte 0.
@@ -151,12 +153,15 @@ enum {
  *                       that this instruction must have vex.W or evex.W set.
  *                     if bit 4 (OPCODE_SUFFIX) set, opcode based on suffix byte
  *                       that byte is stored as the byte 0
- *                       if REQUIRES_VEX then this bit instead means that
- *                       this instruction must have vex.L set.
+ *                       if REQUIRES_VEX or REQUIRES_EVEX then this bit instead means
+ *                       that this instruction must have vex.L or evex.L set.
  *                     XXX i#1312: Possibly a case for EVEX_LL (L') needs to be
  *                     supported at some point.
  *                     XXX: so we do not support an instr that has an opcode
  *                     dependent on both a prefix and the entire modrm or suffix!
+ *                     XXX: perhaps we should use the flags rather than cramming all
+ *                     of this information into the opcode byte, especially with the
+ *                     VEX/EVEX dependent behavior.
  *   2nd nibble (ls) = bits 1-3 hold /n for OPCODE_REG
  *                     if bit 4 (OPCODE_THREEBYTES) is set, the opcode has
  *                       3 bytes, with the first being an implied 0x0f (so
@@ -223,8 +228,8 @@ enum {
     XOP_A_EXT,
     /* instructions differing based on evex */
     EVEX_PREFIX_EXT,
-    /* instructions differing based on evex.W */
-    EVEX_W_EXT,
+    /* instructions differing based on evex.W and evex.b */
+    EVEX_Wb_EXT,
     /* XXX i#1312: We probably do not need EVEX_LL_EXT. L' does not seem to be part
      * of any instruction's opcode. Remove this comment when this has been finalized.
      */
@@ -290,6 +295,10 @@ enum {
 #define DR_EVEX_INPUT_OPSZ_4 0x80000
 /* 64-bit input size in the context of Intel's AVX-512 compressed disp8. */
 #define DR_EVEX_INPUT_OPSZ_8 0x100000
+/* The EVEX.b bit indicates all exceptions are suppresed. {sae} */
+#define EVEX_b_IS_SAE 0x200000
+/* The EVEX.L/EVEX.LL bits are used for rounding control, not size. {er} */
+#define EVEX_L_LL_IS_ER 0x400000
 
 struct _decode_info_t {
     uint opcode;
@@ -353,7 +362,7 @@ struct _decode_info_t {
     bool evex_encoded;
     byte evex_aaa; /* aaa bits for opmask */
     /* for instr_t* target encoding */
-    ptr_int_t cur_note;
+    ptr_int_t cur_offs;
     bool has_instr_opnds;
     dr_tuple_type_t tuple_type;
     opnd_size_t input_size;
@@ -361,6 +370,9 @@ struct _decode_info_t {
 
 /* N.B.: if you change the type enum, change the string names for
  * them, kept in encode.c
+ *
+ * The TYPE_x enums are listed in 'Appendix A Opcode Map (Intel SDM Volume 2)'
+ * specifically A.2.1 Codes for Addressing Method
  */
 
 /* operand types have 2 parts, type and size */
@@ -547,7 +559,7 @@ extern const byte xop_a_index[256];
 extern const instr_info_t xop_prefix_extensions[][2];
 extern const instr_info_t xop_extensions[];
 extern const instr_info_t evex_prefix_extensions[][2];
-extern const instr_info_t evex_W_extensions[][2];
+extern const instr_info_t evex_Wb_extensions[][4];
 
 /* table that translates opcode enums into pointers into decoding tables */
 extern const instr_info_t *const op_instr[];

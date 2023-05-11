@@ -1,5 +1,5 @@
 # **********************************************************
-# Copyright (c) 2010-2020 Google, Inc.    All rights reserved.
+# Copyright (c) 2010-2021 Google, Inc.    All rights reserved.
 # Copyright (c) 2009-2010 VMware, Inc.    All rights reserved.
 # **********************************************************
 
@@ -29,7 +29,7 @@
 # OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH
 # DAMAGE.
 
-cmake_minimum_required(VERSION 2.6)
+cmake_minimum_required(VERSION 3.7)
 
 include(../../make/policies.cmake NO_POLICY_SCOPE)
 
@@ -106,12 +106,8 @@ if (WIN32)
   if (dbghelp_path)
     DR_install(FILES "${dbghelp_path}" DESTINATION ${INSTALL_CLIENTS_BIN})
   endif ()
-  # for build dir
-  add_custom_command(TARGET drcov2lcov POST_BUILD
-    COMMAND ${CMAKE_COMMAND}
-    ARGS -E copy ${DR_LIBRARY_OUTPUT_DIRECTORY}/dynamorio.dll
-    ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/dynamorio.dll
-    VERBATIM)
+  # We need a copy of DR for the build dir:
+  add_dependencies(drcov2lcov client_dr_copy)
 endif (WIN32)
 
 set(INSTALL_DRCOV_CONFIG ${INSTALL_CLIENTS_BASE})
@@ -179,15 +175,20 @@ get_property(dox_targets GLOBAL PROPERTY DynamoRIO_dox_targets)
 set_property(GLOBAL PROPERTY DynamoRIO_dox_targets ${dox_targets} ${doctgt})
 
 add_custom_target(${doctgt} DEPENDS ${gendoc})
-add_custom_command(
-  OUTPUT ${gendoc}
-  DEPENDS ${srcdoc}
-  drcov2lcov
-  COMMAND ${CMAKE_COMMAND}
-  ARGS -D src=${srcdoc}
-       -D dst=${gendoc}
-       -D CMAKE_CROSSCOMPILING=${CMAKE_CROSSCOMPILING}
-       -D prog=$<TARGET_FILE:drcov2lcov>
-       -D prog_arg=-help_html
-       -P ${CMAKE_CURRENT_SOURCE_DIR}/../common/gendocs.cmake
-  VERBATIM)
+# FIXME i#3544: Re-enable once RISC-V binaries work so that options can be generated.
+if (RISCV64 AND NOT CMAKE_CROSSCOMPILING)
+  file(COPY_FILE ${srcdoc} ${gendoc})
+else ()
+  add_custom_command(
+    OUTPUT ${gendoc}
+    DEPENDS ${srcdoc}
+    drcov2lcov
+    COMMAND ${CMAKE_COMMAND}
+    ARGS -D src=${srcdoc}
+        -D dst=${gendoc}
+        -D CMAKE_CROSSCOMPILING=${CMAKE_CROSSCOMPILING}
+        -D prog=$<TARGET_FILE:drcov2lcov>
+        -D prog_arg=-help_html
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/../common/gendocs.cmake
+    VERBATIM)
+endif ()

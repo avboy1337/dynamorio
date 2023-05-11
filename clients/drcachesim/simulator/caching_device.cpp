@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2015-2020 Google, Inc.  All rights reserved.
+ * Copyright (c) 2015-2021 Google, Inc.  All rights reserved.
  * **********************************************************/
 
 /*
@@ -42,8 +42,11 @@ caching_device_t::caching_device_t()
     : blocks_(NULL)
     , stats_(NULL)
     , prefetcher_(NULL)
+    // The tag being hashed is already right-shifted to the cache line and
+    // an identity hash is plenty good enough and nice and fast.
+    // We set the size and load factor only if being used, in set_hashtable_use().
+    , tag2block(0, [](addr_t key) { return static_cast<unsigned long>(key); })
 {
-    /* Empty. */
 }
 
 caching_device_t::~caching_device_t()
@@ -62,10 +65,11 @@ caching_device_t::init(int associativity, int block_size, int num_blocks,
                        int id, snoop_filter_t *snoop_filter,
                        const std::vector<caching_device_t *> &children)
 {
-    if (!IS_POWER_OF_2(associativity) || !IS_POWER_OF_2(block_size) ||
-        !IS_POWER_OF_2(num_blocks) ||
-        // Assuming caching device block size is at least 4 bytes
-        block_size < 4)
+    // Assume cache has nonzero capacity.
+    if (associativity < 1 || num_blocks < 1)
+        return false;
+    // Assume caching device block size is at least 4 bytes.
+    if (!IS_POWER_OF_2(block_size) || block_size < 4)
         return false;
     if (stats == NULL)
         return false; // A stats must be provided for perf: avoid conditional code
@@ -75,11 +79,15 @@ caching_device_t::init(int associativity, int block_size, int num_blocks,
     block_size_ = block_size;
     num_blocks_ = num_blocks;
     loaded_blocks_ = 0;
-    blocks_per_set_ = num_blocks_ / associativity;
-    assoc_bits_ = compute_log2(associativity_);
+    blocks_per_way_ = num_blocks_ / associativity;
+    // Make sure num_blocks_ is evenly divisible by associativity
+    if (blocks_per_way_ * associativity_ != num_blocks_)
+        return false;
+    blocks_per_way_mask_ = blocks_per_way_ - 1;
     block_size_bits_ = compute_log2(block_size);
-    blocks_per_set_mask_ = blocks_per_set_ - 1;
-    if (assoc_bits_ == -1 || block_size_bits_ == -1 || !IS_POWER_OF_2(blocks_per_set_))
+    // Non-power-of-two associativities and total cache sizes are allowed, so
+    // long as the number blocks per cache way is a power of two.
+    if (block_size_bits_ == -1 || !IS_POWER_OF_2(blocks_per_way_))
         return false;
     parent_ = parent;
     stats_ = stats;
@@ -97,6 +105,25 @@ caching_device_t::init(int associativity, int block_size, int num_blocks,
     children_ = children;
 
     return true;
+}
+
+std::pair<caching_device_block_t *, int>
+caching_device_t::find_caching_device_block(addr_t tag)
+{
+    if (use_tag2block_table_) {
+        auto it = tag2block.find(tag);
+        if (it == tag2block.end())
+            return std::make_pair(nullptr, 0);
+        assert(it->second.first->tag_ == tag);
+        return it->second;
+    }
+    int block_idx = compute_block_idx(tag);
+    for (int way = 0; way < associativity_; ++way) {
+        caching_device_block_t &block = get_caching_device_block(block_idx, way);
+        if (block.tag_ == tag)
+            return std::make_pair(&block, way);
+    }
+    return std::make_pair(nullptr, 0);
 }
 
 void
@@ -118,37 +145,26 @@ caching_device_t::request(const memref_t &memref_in)
         caching_device_block_t *cache_block =
             &get_caching_device_block(last_block_idx_, last_way_);
         assert(tag != TAG_INVALID && tag == cache_block->tag_);
-        stats_->access(memref_in, true /*hit*/, cache_block);
-        if (parent_ != NULL)
-            parent_->stats_->child_access(memref_in, true, cache_block);
+        record_access_stats(memref_in, true /*hit*/, cache_block);
         access_update(last_block_idx_, last_way_);
         return;
     }
 
     memref = memref_in;
     for (; tag <= final_tag; ++tag) {
-        int way;
+        int way = associativity_;
         int block_idx = compute_block_idx(tag);
         bool missed = false;
 
         if (tag + 1 <= final_tag)
             memref.data.size = ((tag + 1) << block_size_bits_) - memref.data.addr;
 
-        for (way = 0; way < associativity_; ++way) {
-            caching_device_block_t *cache_block =
-                &get_caching_device_block(block_idx, way);
-            if (cache_block->tag_ == tag) {
-                break;
-            }
-        }
-
-        if (way != associativity_) {
+        auto block_way = find_caching_device_block(tag);
+        if (block_way.first != nullptr) {
             // Access is a hit.
-            caching_device_block_t *cache_block =
-                &get_caching_device_block(block_idx, way);
-            stats_->access(memref, true /*hit*/, cache_block);
-            if (parent_ != NULL)
-                parent_->stats_->child_access(memref, true, cache_block);
+            caching_device_block_t *cache_block = block_way.first;
+            way = block_way.second;
+            record_access_stats(memref, true /*hit*/, cache_block);
             if (coherent_cache_ && memref.data.type == TRACE_TYPE_WRITE) {
                 // On a hit, we must notify the snoop filter of the write or propagate
                 // the write to a snooped cache.
@@ -166,13 +182,11 @@ caching_device_t::request(const memref_t &memref_in)
             caching_device_block_t *cache_block =
                 &get_caching_device_block(block_idx, way);
 
-            stats_->access(memref, false /*miss*/, cache_block);
+            record_access_stats(memref, false /*miss*/, cache_block);
             missed = true;
             // If no parent we assume we get the data from main memory
-            if (parent_ != NULL) {
-                parent_->stats_->child_access(memref, false, cache_block);
+            if (parent_ != NULL)
                 parent_->request(memref);
-            }
             if (snoop_filter_ != NULL) {
                 // Update snoop filter, other private caches invalidated on write.
                 snoop_filter_->snoop(tag, id_, (memref.data.type == TRACE_TYPE_WRITE));
@@ -215,7 +229,7 @@ caching_device_t::request(const memref_t &memref_in)
                     }
                 }
             }
-            cache_block->tag_ = tag;
+            update_tag(cache_block, way, tag);
         }
 
         access_update(block_idx, way);
@@ -248,6 +262,15 @@ caching_device_t::access_update(int block_idx, int way)
 int
 caching_device_t::replace_which_way(int block_idx)
 {
+    int min_way = get_next_way_to_replace(block_idx);
+    // Clear the counter for LFU.
+    get_caching_device_block(block_idx, min_way).counter_ = 0;
+    return min_way;
+}
+
+int
+caching_device_t::get_next_way_to_replace(const int block_idx) const
+{
     // The base caching device class only implements LFU.
     // A subclass can override this and access_update() to implement
     // some other scheme.
@@ -263,34 +286,26 @@ caching_device_t::replace_which_way(int block_idx)
             min_way = way;
         }
     }
-    // Clear the counter for LFU.
-    get_caching_device_block(block_idx, min_way).counter_ = 0;
     return min_way;
 }
 
 void
 caching_device_t::invalidate(addr_t tag, invalidation_type_t invalidation_type)
 {
-    int block_idx = compute_block_idx(tag);
-
-    for (int way = 0; way < associativity_; ++way) {
-        auto &cache_block = get_caching_device_block(block_idx, way);
-        if (cache_block.tag_ == tag) {
-            cache_block.tag_ = TAG_INVALID;
-            cache_block.counter_ = 0;
-            stats_->invalidate(invalidation_type);
-            // Invalidate last_tag_ if it was this tag.
-            if (last_tag_ == tag) {
-                last_tag_ = TAG_INVALID;
+    auto block_way = find_caching_device_block(tag);
+    if (block_way.first != nullptr) {
+        invalidate_caching_device_block(block_way.first);
+        stats_->invalidate(invalidation_type);
+        // Invalidate last_tag_ if it was this tag.
+        if (last_tag_ == tag) {
+            last_tag_ = TAG_INVALID;
+        }
+        // Invalidate the block in the children's caches.
+        if (invalidation_type == INVALIDATION_INCLUSIVE && inclusive_ &&
+            !children_.empty()) {
+            for (auto &child : children_) {
+                child->invalidate(tag, invalidation_type);
             }
-            // Invalidate the block in the children's caches.
-            if (invalidation_type == INVALIDATION_INCLUSIVE && inclusive_ &&
-                !children_.empty()) {
-                for (auto &child : children_) {
-                    child->invalidate(tag, invalidation_type);
-                }
-            }
-            break;
         }
     }
     // If this is a coherence invalidation, we must invalidate children caches.
@@ -305,12 +320,9 @@ caching_device_t::invalidate(addr_t tag, invalidation_type_t invalidation_type)
 bool
 caching_device_t::contains_tag(addr_t tag)
 {
-    int block_idx = compute_block_idx(tag);
-    for (int way = 0; way < associativity_; way++) {
-        if (get_caching_device_block(block_idx, way).tag_ == tag) {
-            return true;
-        }
-    }
+    auto block_way = find_caching_device_block(tag);
+    if (block_way.first != nullptr)
+        return true;
     if (children_.empty()) {
         return false;
     }
@@ -328,12 +340,9 @@ void
 caching_device_t::propagate_eviction(addr_t tag, const caching_device_t *requester)
 {
     // Check our own cache for this line.
-    int block_idx = compute_block_idx(tag);
-    for (int way = 0; way < associativity_; way++) {
-        if (get_caching_device_block(block_idx, way).tag_ == tag) {
-            return;
-        }
-    }
+    auto block_way = find_caching_device_block(tag);
+    if (block_way.first != nullptr)
+        return;
 
     // Check if other children contain this line.
     if (children_.size() != 1) {
@@ -374,4 +383,18 @@ caching_device_t::propagate_write(addr_t tag, const caching_device_t *requester)
     } else if (parent_ != NULL) {
         parent_->propagate_write(tag, this);
     }
+}
+
+void
+caching_device_t::record_access_stats(const memref_t &memref, bool hit,
+                                      caching_device_block_t *cache_block)
+{
+    stats_->access(memref, hit, cache_block);
+    // We propagate hits all the way up the hierachy.
+    // But to avoid over-counting we only propagate misses one level up.
+    if (hit) {
+        for (caching_device_t *up = parent_; up != nullptr; up = up->parent_)
+            up->stats_->child_access(memref, hit, cache_block);
+    } else if (parent_ != nullptr)
+        parent_->stats_->child_access(memref, hit, cache_block);
 }

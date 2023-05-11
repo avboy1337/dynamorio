@@ -1,5 +1,5 @@
 /* *******************************************************************************
- * Copyright (c) 2011-2020 Google, Inc.  All rights reserved.
+ * Copyright (c) 2011-2023 Google, Inc.  All rights reserved.
  * Copyright (c) 2011 Massachusetts Institute of Technology  All rights reserved.
  * *******************************************************************************/
 
@@ -109,6 +109,9 @@ static const char *const system_lib_paths[] = {
 #    elif defined(AARCH64)
     "/lib/aarch64-linux-gnu",
     "/usr/lib/aarch64-linux-gnu",
+#    elif defined(RISCV64)
+    "/lib/riscv64-linux-gnu",
+    "/usr/lib/riscv64-linux-gnu",
 #    endif
 #endif
 };
@@ -121,12 +124,10 @@ static const char *const system_lib_paths[] = {
 static os_privmod_data_t *libdr_opd;
 
 #ifdef LINUX /* XXX i#1285: implement MacOS private loader */
-#    if defined(INTERNAL) || defined(CLIENT_INTERFACE)
 static bool printed_gdb_commands = false;
 /* Global so visible in release build gdb */
 static char gdb_priv_cmds[4096];
 static size_t gdb_priv_cmds_sofar;
-#    endif
 #endif
 
 /* pointing to the I/O data structure in privately loaded libc,
@@ -138,6 +139,7 @@ stdfile_t **privmod_stdin;
 #define LIBC_STDOUT_NAME "stdout"
 #define LIBC_STDERR_NAME "stderr"
 #define LIBC_STDIN_NAME "stdin"
+#define LIBC_EARLY_INIT_NAME "__libc_early_init"
 
 /* We save the original sp from the kernel, for use by TLS setup on Android */
 void *kernel_init_sp;
@@ -193,7 +195,6 @@ dr_gdb_add_symbol_file(const char *filename, app_pc textaddr)
 }
 
 #ifdef LINUX /* XXX i#1285: implement MacOS private loader */
-#    if defined(INTERNAL) || defined(CLIENT_INTERFACE)
 static void
 privload_add_gdb_cmd(elf_loader_t *loader, const char *filename, bool reachable)
 {
@@ -221,12 +222,11 @@ privload_add_gdb_cmd(elf_loader_t *loader, const char *filename, bool reachable)
         }
         LOG(GLOBAL, LOG_LOADER, 1, "for debugger: add-symbol-file %s %p\n", filename,
             text_addr);
-        if (IF_CLIENT_INTERFACE_ELSE(INTERNAL_OPTION(privload_register_gdb), false)) {
+        if (INTERNAL_OPTION(privload_register_gdb)) {
             dr_gdb_add_symbol_file(filename, text_addr);
         }
     }
 }
-#    endif
 #endif
 
 /* os specific loader initialization prologue before finalizing the load. */
@@ -274,7 +274,7 @@ os_loader_init_prologue(void)
         }
     });
     mod->externally_loaded = true;
-#    if defined(LINUX) /*i#1285*/ && (defined(INTERNAL) || defined(CLIENT_INTERFACE))
+#    ifdef LINUX /*i#1285*/
     if (DYNAMO_OPTION(early_inject)) {
         /* libdynamorio isn't visible to gdb so add to the cmd list */
         byte *dr_base = get_dynamorio_dll_start(), *pref_base;
@@ -297,7 +297,6 @@ void
 os_loader_init_epilogue(void)
 {
 #ifdef LINUX /* XXX i#1285: implement MacOS private loader */
-#    if defined(INTERNAL) || defined(CLIENT_INTERFACE)
     /* Print the add-symbol-file commands so they can be copy-pasted into gdb.
      * We have to do it in a single syslog so they can be copy pasted.
      * For non-internal builds, or for private libs loaded after this point,
@@ -313,7 +312,6 @@ os_loader_init_epilogue(void)
                              "%s",
                              gdb_priv_cmds);
     }
-#    endif /* INTERNAL || CLIENT_INTERFACE */
 #endif
 }
 
@@ -327,7 +325,7 @@ os_loader_exit(void)
                        PROTECTED);
     }
 
-#if defined(LINUX) && (defined(INTERNAL) || defined(CLIENT_INTERFACE))
+#ifdef LINUX
     /* Put printed_gdb_commands into its original state for potential
      * re-attaching and os_loader_init_epilogue().
      */
@@ -527,17 +525,15 @@ privload_map_and_relocate(const char *filename, size_t *size OUT, modload_flags_
         }
         return NULL;
     }
-    base =
-        elf_loader_map_phdrs(&loader, false /* fixed */, map_func, unmap_func, prot_func,
-                             privload_check_new_map_bounds, privload_map_flags(flags));
+    base = elf_loader_map_phdrs(&loader, false /* fixed */, map_func, unmap_func,
+                                prot_func, privload_check_new_map_bounds, memset,
+                                privload_map_flags(flags));
     if (base != NULL) {
         if (size != NULL)
             *size = loader.image_size;
 
-#    if defined(INTERNAL) || defined(CLIENT_INTERFACE)
         if (!TEST(MODLOAD_NOT_PRIVLIB, flags))
             privload_add_gdb_cmd(&loader, filename, TEST(MODLOAD_REACHABLE, flags));
-#    endif
     }
     elf_loader_destroy(&loader);
 
@@ -573,14 +569,21 @@ privload_process_imports(privmod_t *mod)
                     privload_locate_and_load(name, mod, false /*client dir=>true*/);
                 if (impmod == NULL)
                     return false;
-#    ifdef CLIENT_INTERFACE
+                if (strstr(name, "libpthread") == name) {
+                    /* i#956: A private libpthread is not fully supported, but many
+                     * libraries import some utilities from it and do not use
+                     * threading.  We load it and just do not guarantee things will
+                     * work if thread-related routines are called.
+                     */
+                    SYSLOG_INTERNAL_WARNING(
+                        "private libpthread.so loaded but not fully supported (i#956)");
+                }
                 /* i#852: identify all libs that import from DR as client libs.
                  * XXX: this code seems stale as libdynamorio.so is already loaded
                  * (xref #3850).
                  */
                 if (impmod->base == get_dynamorio_dll_start())
                     mod->is_client = true;
-#    endif
             }
         }
         ++dyn;
@@ -667,9 +670,93 @@ privload_redirect_setup(privmod_t *privmod)
 }
 
 void
-privload_os_finalize(privmod_t *privmod_t)
+privload_os_finalize(privmod_t *privmod)
 {
-    /* nothing */
+#ifndef LINUX
+    return; /* Nothing to do. */
+#else
+    static privmod_t *privmod_ld_linux;
+    if (strstr(privmod->name, "ld-linux") == privmod->name) {
+        /* We need to first get the libc version before we clobber ld vars.
+         * (We could instead look for versioned symbols with "@GLIBC_2.34" in ld
+         * but we do not have version parsing code in place.)
+         * We assume ld will not be unloaded.
+         */
+        privmod_ld_linux = privmod;
+        return;
+    }
+    if (strstr(privmod->name, "libc.so") != privmod->name)
+        return;
+    os_privmod_data_t *opd = (os_privmod_data_t *)privmod->os_privmod_data;
+    /* Special handling for standard I/O file descriptors. */
+    privmod_stdout = (FILE **)get_proc_address_from_os_data(
+        &opd->os_data, opd->load_delta, LIBC_STDOUT_NAME, NULL);
+    privmod_stdin = (FILE **)get_proc_address_from_os_data(&opd->os_data, opd->load_delta,
+                                                           LIBC_STDIN_NAME, NULL);
+    privmod_stderr = (FILE **)get_proc_address_from_os_data(
+        &opd->os_data, opd->load_delta, LIBC_STDERR_NAME, NULL);
+    /* i#5133: glibc 2.32+ has ld.so call a hardcoded initializer before calling the
+     * regular ELF constructors.
+     */
+    void (*libc_early_init)(bool) = (void (*)(bool))get_proc_address_from_os_data(
+        &opd->os_data, opd->load_delta, LIBC_EARLY_INIT_NAME, NULL);
+    if (libc_early_init == NULL) {
+        return;
+    }
+    /* XXX i#5437: Temporary workaround to avoid a SIGFPE in glibc 2.34+
+     * __libc_early_init(). As we cannot let ld/libc initialize their own TLS with the
+     * current design, we must explicitly initialize a few variables.  Unfortunately
+     * we have to hardcode their offsets, making this fragile. Long-term we should try
+     * to find a better solution.
+     */
+    /* Do not try to clobber vars unless we have to: get the libc version. */
+#    define LIBC_GET_VERSION_NAME "gnu_get_libc_version"
+    const char *(*libc_ver)(void) = (const char *(*)(void))get_proc_address_from_os_data(
+        &opd->os_data, opd->load_delta, LIBC_GET_VERSION_NAME, NULL);
+    if (libc_ver == NULL)
+        return;
+    LOG(GLOBAL, LOG_LOADER, 2, "%s: calling %s\n", __FUNCTION__, LIBC_GET_VERSION_NAME);
+    const char *ver = (*libc_ver)();
+    LOG(GLOBAL, LOG_LOADER, 2, "%s: libc version is |%s|\n", __FUNCTION__, ver);
+    if ((ver[0] == '\0' || ver[0] < '2') || ver[1] != '.' || ver[2] < '3' ||
+        (ver[2] == '3' && ver[3] < '4'))
+        return;
+    if (privmod_ld_linux == NULL) {
+        SYSLOG_INTERNAL_WARNING("glibc 2.34+ i#5437 workaround failed: missed ld");
+        return;
+    }
+    os_privmod_data_t *ld_opd = (os_privmod_data_t *)privmod_ld_linux->os_privmod_data;
+    byte *glro = get_proc_address_from_os_data(&ld_opd->os_data, ld_opd->load_delta,
+                                               "_rtld_global_ro", NULL);
+    if (glro == NULL) {
+        SYSLOG_INTERNAL_WARNING("glibc 2.34+ i#5437 workaround failed: missed glro");
+        return;
+    }
+#    ifdef X64
+    const int GLRO_dl_tls_static_size_OFFS = 0x2a8;
+    const int GLRO_dl_tls_static_align_OFFS = 0x2b0;
+#    else
+    // The offsets changed between 2.35 and 2.36.
+    const int GLRO_dl_tls_static_size_OFFS =
+        (ver[2] == '3' && ver[3] == '5') ? 0x328 : 0x31c;
+    const int GLRO_dl_tls_static_align_OFFS =
+        (ver[2] == '3' && ver[3] == '5') ? 0x32c : 0x320;
+#    endif
+    size_t val = 4096, written;
+    if (!safe_write_ex(glro + GLRO_dl_tls_static_size_OFFS, sizeof(val), &val,
+                       &written) ||
+        written != sizeof(val) ||
+        !safe_write_ex(glro + GLRO_dl_tls_static_align_OFFS, sizeof(val), &val,
+                       &written) ||
+        written != sizeof(val)) {
+        SYSLOG_INTERNAL_WARNING("glibc 2.34+ i#5437 workaround failed: missed write");
+    } else {
+        LOG(GLOBAL, LOG_LOADER, 2, "%s: glibc 2.34+ workaround succeeded\n",
+            __FUNCTION__);
+    }
+    LOG(GLOBAL, LOG_LOADER, 2, "%s: calling %s\n", __FUNCTION__, LIBC_EARLY_INIT_NAME);
+    (*libc_early_init)(true);
+#endif /* LINUX */
 }
 
 static void
@@ -764,7 +851,6 @@ privload_search_rpath(privmod_t *mod, bool runpath, const char *name,
                     snprintf(path, BUFFER_SIZE_ELEMENTS(path), "%.*s", len, list);
                     NULL_TERMINATE_BUFFER(path);
                 }
-#    ifdef CLIENT_INTERFACE
                 if (mod->is_client) {
                     /* We are adding a client's lib rpath to the general search path. This
                      * is not bullet proof compliant with what the loader should really
@@ -788,7 +874,6 @@ privload_search_rpath(privmod_t *mod, bool runpath, const char *name,
                         search_paths_idx++;
                     }
                 }
-#    endif
                 if (!lib_found) {
                     snprintf(filename, MAXIMUM_PATH, "%s/%s", path, name);
                     filename[MAXIMUM_PATH - 1] = 0;
@@ -796,11 +881,7 @@ privload_search_rpath(privmod_t *mod, bool runpath, const char *name,
                         filename);
                     if (os_file_exists(filename, false /*!is_dir*/) &&
                         module_file_has_module_header(filename)) {
-#    ifdef CLIENT_INTERFACE
                         lib_found = true;
-#    else
-                        return true;
-#    endif
                     }
                 }
                 list += len;
@@ -887,8 +968,19 @@ privload_locate(const char *name, privmod_t *dep,
     if (dep != NULL && privload_search_rpath(dep, true /*runpath*/, name, filename))
         return true;
 
-    /* 5) FIXME: i#460, we use our system paths instead of /etc/ld.so.cache. */
+    /* 5) XXX i#460: We use our system paths instead of /etc/ld.so.cache. */
     for (i = 0; i < NUM_SYSTEM_LIB_PATHS; i++) {
+        /* First try -xarch_root for emulation. */
+        if (!IS_STRING_OPTION_EMPTY(xarch_root)) {
+            string_option_read_lock();
+            snprintf(filename, MAXIMUM_PATH, "%s/%s/%s", DYNAMO_OPTION(xarch_root),
+                     system_lib_paths[i], name);
+            filename[MAXIMUM_PATH - 1] = '\0';
+            string_option_read_unlock();
+            if (os_file_exists(filename, false /*!is_dir*/) &&
+                module_file_has_module_header(filename))
+                return true;
+        }
         snprintf(filename, MAXIMUM_PATH, "%s/%s", system_lib_paths[i], name);
         /* NULL_TERMINATE_BUFFER(filename) */
         filename[MAXIMUM_PATH - 1] = 0;
@@ -1092,6 +1184,30 @@ privload_relocate_rela(os_privmod_data_t *opd, ELF_RELA_TYPE *start, ELF_RELA_TY
         privload_relocate_symbol((ELF_REL_TYPE *)rela, opd, true);
 }
 
+/* XXX: This routine is called before dynamorio relocation when we are in a
+ * fragile state and thus no globals access or use of ASSERT/LOG/STATS!
+ */
+/* This routine is duplicated from module_relocate_relr for relocating dynamorio. */
+static void
+privload_relocate_relr(os_privmod_data_t *opd, const ELF_WORD *relr, size_t size)
+{
+    ELF_ADDR *r_addr = NULL;
+
+    for (; size != 0; relr++, size -= sizeof(ELF_WORD)) {
+        if (!TEST(1, relr[0])) {
+            r_addr = (ELF_ADDR *)(relr[0] + opd->load_delta);
+            *r_addr++ += opd->load_delta;
+        } else {
+            int i = 0;
+            for (ELF_WORD bitmap = relr[0]; (bitmap >>= 1) != 0; i++) {
+                if (TEST(1, bitmap))
+                    r_addr[i] += opd->load_delta;
+            }
+            r_addr += CHAR_BIT * sizeof(ELF_WORD) - 1;
+        }
+    }
+}
+
 /* XXX: This routine may be called before dynamorio relocation when we are in a
  * fragile state and thus no globals access or use of ASSERT/LOG/STATS!
  */
@@ -1104,6 +1220,9 @@ privload_early_relocate_os_privmod_data(os_privmod_data_t *opd, byte *mod_base)
 
     if (opd->rela != NULL)
         privload_relocate_rela(opd, opd->rela, opd->rela + opd->relasz / opd->relaent);
+
+    if (opd->relr != NULL)
+        privload_relocate_relr(opd, opd->relr, opd->relrsz);
 
     if (opd->jmprel != NULL) {
         if (opd->pltrel == DT_REL) {
@@ -1130,13 +1249,26 @@ privload_relocate_os_privmod_data(os_privmod_data_t *opd, byte *mod_base)
         module_relocate_rela(mod_base, opd, opd->rela,
                              opd->rela + opd->relasz / opd->relaent);
     }
+    if (opd->relr != NULL)
+        module_relocate_relr(mod_base, opd, opd->relr, opd->relrsz);
     if (opd->jmprel != NULL) {
+        app_pc jmprel_start = opd->jmprel;
+        app_pc jmprel_end = opd->jmprel + opd->pltrelsz;
+        /* i#5080: Some libs list JMPREL as overlapping with REL{,A} and it's implied
+         * that really JMPREL comes after.
+         */
+        if (opd->rel != NULL && jmprel_start >= (app_pc)opd->rel &&
+            jmprel_start < (app_pc)(opd->rel + opd->relsz / opd->relent))
+            jmprel_start = (app_pc)(opd->rel + opd->relsz / opd->relent);
+        if (opd->rela != NULL && jmprel_start >= (app_pc)opd->rela &&
+            jmprel_start < (app_pc)(opd->rela + opd->relasz / opd->relaent))
+            jmprel_start = (app_pc)(opd->rela + opd->relasz / opd->relaent);
         if (opd->pltrel == DT_REL) {
-            module_relocate_rel(mod_base, opd, (ELF_REL_TYPE *)opd->jmprel,
-                                (ELF_REL_TYPE *)(opd->jmprel + opd->pltrelsz));
+            module_relocate_rel(mod_base, opd, (ELF_REL_TYPE *)jmprel_start,
+                                (ELF_REL_TYPE *)jmprel_end);
         } else if (opd->pltrel == DT_RELA) {
-            module_relocate_rela(mod_base, opd, (ELF_RELA_TYPE *)opd->jmprel,
-                                 (ELF_RELA_TYPE *)(opd->jmprel + opd->pltrelsz));
+            module_relocate_rela(mod_base, opd, (ELF_RELA_TYPE *)jmprel_start,
+                                 (ELF_RELA_TYPE *)jmprel_end);
         } else {
             ASSERT(false);
         }
@@ -1168,16 +1300,6 @@ privload_relocate_mod(privmod_t *mod)
      */
     if (opd->tls_block_size != 0)
         privload_mod_tls_primary_thread_init(mod);
-
-    /* special handling on I/O file */
-    if (strstr(mod->name, "libc.so") == mod->name) {
-        privmod_stdout = (FILE **)get_proc_address_from_os_data(
-            &opd->os_data, opd->load_delta, LIBC_STDOUT_NAME, NULL);
-        privmod_stdin = (FILE **)get_proc_address_from_os_data(
-            &opd->os_data, opd->load_delta, LIBC_STDIN_NAME, NULL);
-        privmod_stderr = (FILE **)get_proc_address_from_os_data(
-            &opd->os_data, opd->load_delta, LIBC_STDERR_NAME, NULL);
-    }
 #else
     /* XXX i#1285: implement MacOS private loader */
 #endif
@@ -1199,6 +1321,13 @@ privload_create_os_privmod_data(privmod_t *privmod, bool dyn_reloc)
                                 dyn_reloc, &opd->os_data.base_address, NULL,
                                 &opd->max_end, &opd->soname, &opd->os_data);
     module_get_os_privmod_data(privmod->base, privmod->size, false /*!relocated*/, opd);
+    /* We want libunwind to walk app libraries.
+     * XXX: Is there a cleaner way to do this for some libraries but not others?
+     */
+    if (strstr(privmod->name, "libunwind") == privmod->name) {
+        LOG(GLOBAL, LOG_LOADER, 2, "Using app imports for %s\n", privmod->name);
+        opd->use_app_imports = true;
+    }
 }
 
 static void
@@ -1242,6 +1371,9 @@ privload_fill_os_module_info(app_pc base, OUT app_pc *out_base /* relative pc */
  * Function Redirection
  */
 
+static void *
+redirect_dlsym(void *handle, const char *symbol);
+
 #if defined(LINUX) && !defined(ANDROID)
 /* These are not yet supported by Android's Bionic */
 void *
@@ -1270,7 +1402,7 @@ redirect_dl_iterate_phdr(int (*callback)(struct dl_phdr_info *info, size_t size,
         if (mod->base == get_dynamorio_dll_start())
             continue;
         info.dlpi_addr = opd->load_delta;
-        info.dlpi_name = mod->name;
+        info.dlpi_name = mod->path;
         info.dlpi_phdr = (ELF_PROGRAM_HEADER_TYPE *)(mod->base + elf_hdr->e_phoff);
         info.dlpi_phnum = elf_hdr->e_phnum;
         res = callback(&info, sizeof(info), data);
@@ -1278,6 +1410,47 @@ redirect_dl_iterate_phdr(int (*callback)(struct dl_phdr_info *info, size_t size,
             break;
     }
     release_recursive_lock(&privload_lock);
+    return res;
+}
+
+/* For some cases we want the client library to walk the app libs: e.g., for
+ * callstack walking (i#2414).
+ */
+static int
+redirect_dl_iterate_phdr_app(int (*callback)(struct dl_phdr_info *info, size_t size,
+                                             void *data),
+                             void *data)
+{
+    int res = 0;
+    struct dl_phdr_info info;
+    module_iterator_t *iter = module_iterator_start();
+    while (module_iterator_hasnext(iter)) {
+        module_area_t *area = module_iterator_next(iter);
+        ASSERT(area != NULL);
+        ELF_HEADER_TYPE *elf_hdr = (ELF_HEADER_TYPE *)area->start;
+        /* We do want to include externally loaded (if any) and clients as
+         * clients can contain C++ exception code, which will call here.
+         */
+        if (area->start == get_dynamorio_dll_start())
+            continue;
+        app_pc preferred_base =
+            IF_WINDOWS_ELSE(area->os_data.preferred_base, area->os_data.base_address);
+        info.dlpi_addr = area->start - preferred_base;
+        info.dlpi_name = area->full_path;
+        info.dlpi_phdr = (ELF_PROGRAM_HEADER_TYPE *)(area->start + elf_hdr->e_phoff);
+        info.dlpi_phnum = elf_hdr->e_phnum;
+        /* XXX: Fill in new fields dlpi_{adds,subs,tls_modid,tls_data}.
+         * For now we set the size to exclude them.
+         */
+        size_t size = offsetof(struct dl_phdr_info, dlpi_phnum) + sizeof(info.dlpi_phnum);
+        res = callback(&info, size, data);
+        if (res != 0)
+            break;
+    }
+    module_iterator_stop(iter);
+    // XXX: Pass the private ones too for callstacks or other purposes?  Sometimes
+    // private code is used to replace app code, though we do already have the client
+    // lib itself on the app list.
     return res;
 }
 
@@ -1338,6 +1511,7 @@ redirect___gnu_Unwind_Find_exidx(void *pc, int *count)
 typedef struct _redirect_import_t {
     const char *name;
     app_pc func;
+    app_pc app_func; /* Used only for dl_iterate_phdr over app libs, so far. */
 } redirect_import_t;
 
 static const redirect_import_t redirect_imports[] = {
@@ -1346,25 +1520,35 @@ static const redirect_import_t redirect_imports[] = {
     { "free", (app_pc)redirect_free },
     { "realloc", (app_pc)redirect_realloc },
     { "strdup", (app_pc)redirect_strdup },
-/* TODO i#4243: we should also redirect functions including:
- * + malloc_usable_size, memalign, valloc, mallinfo, mallopt, etc.
- * + tcmalloc: tc_malloc, tc_free, etc.
- * + __libc_malloc, __libc_free, etc.
- * + OSX: malloc_zone_malloc, etc.?  Or just malloc_create_zone?
- * + C++ operators in case they don't just call libc malloc?
- */
+    /* TODO i#4243: we should also redirect functions including:
+     * + malloc_usable_size, memalign, valloc, mallinfo, mallopt, etc.
+     * + tcmalloc: tc_malloc, tc_free, etc.
+     * + __libc_malloc, __libc_free, etc.
+     * + OSX: malloc_zone_malloc, etc.?  Or just malloc_create_zone?
+     * + C++ operators in case they don't just call libc malloc?
+     */
+    /* We redirect these for fd isolation. */
+    { "open", (app_pc)os_open_protected },
+    { "close", (app_pc)os_close_protected },
+    /* These libc routines can call pthread functions and cause hangs (i#4928) so
+     * we use our syscall wrappers instead.
+     */
+    { "read", (app_pc)os_read },
+    { "write", (app_pc)os_write },
 #if defined(LINUX) && !defined(ANDROID)
     { "__tls_get_addr", (app_pc)redirect___tls_get_addr },
     { "___tls_get_addr", (app_pc)redirect____tls_get_addr },
 #endif
 #ifdef LINUX
     /* i#1717: C++ exceptions call this */
-    { "dl_iterate_phdr", (app_pc)redirect_dl_iterate_phdr },
+    { "dl_iterate_phdr", (app_pc)redirect_dl_iterate_phdr,
+      (app_pc)redirect_dl_iterate_phdr_app },
 #    if defined(ARM) && !defined(ANDROID)
     /* i#1717: C++ exceptions call this on ARM Linux */
     { "__gnu_Unwind_Find_exidx", (app_pc)redirect___gnu_Unwind_Find_exidx },
 #    endif
 #endif
+    { "dlsym", (app_pc)redirect_dlsym },
     /* We need these for clients that don't use libc (i#1747) */
     { "strlen", (app_pc)strlen },
     { "wcslen", (app_pc)wcslen },
@@ -1401,7 +1585,7 @@ static const redirect_import_t redirect_debug_imports[] = {
 #endif
 
 bool
-privload_redirect_sym(ptr_uint_t *r_addr, const char *name)
+privload_redirect_sym(os_privmod_data_t *opd, ptr_uint_t *r_addr, const char *name)
 {
     int i;
     /* iterate over all symbols and redirect syms when necessary, e.g. malloc */
@@ -1411,19 +1595,32 @@ privload_redirect_sym(ptr_uint_t *r_addr, const char *name)
             if (strcmp(redirect_debug_imports[i].name, name) == 0) {
                 *r_addr = (ptr_uint_t)redirect_debug_imports[i].func;
                 return true;
-                ;
             }
         }
     }
 #endif
     for (i = 0; i < REDIRECT_IMPORTS_NUM; i++) {
         if (strcmp(redirect_imports[i].name, name) == 0) {
-            *r_addr = (ptr_uint_t)redirect_imports[i].func;
+            if (opd->use_app_imports && redirect_imports[i].app_func != NULL)
+                *r_addr = (ptr_uint_t)redirect_imports[i].app_func;
+            else
+                *r_addr = (ptr_uint_t)redirect_imports[i].func;
             return true;
-            ;
         }
     }
     return false;
+}
+
+static void *
+redirect_dlsym(void *handle, const char *symbol)
+{
+    for (int i = 0; i < REDIRECT_IMPORTS_NUM; i++) {
+        if (strcmp(redirect_imports[i].name, symbol) == 0)
+            return redirect_imports[i].func;
+    }
+    /* TODO: Look in other libs via module_lookup_symbol() from module_elf.c. */
+    SYSLOG_INTERNAL_WARNING("dlsym(%s) called by private lib; returning NULL", symbol);
+    return NULL;
 }
 
 /***************************************************************************
@@ -1500,9 +1697,9 @@ takeover_ptrace(ptrace_stack_args_t *args)
     NULL_TERMINATE_BUFFER(home_var);
     dynamorio_set_envp(fake_envp);
 
-    dynamorio_app_init();
+    dynamo_control_via_attach = true;
 
-    /* FIXME i#37: takeover other threads */
+    dynamorio_app_init();
 
     /* We need to wait until dr_inject_process_run() is called to finish
      * takeover, and this is an easy way to stop and return control to the
@@ -1638,8 +1835,16 @@ privload_mem_is_elf_so_header(byte *mem)
     if (elf_hdr->e_type != ET_DYN)
         return false;
     /* ARM or X86 */
-    if (elf_hdr->e_machine !=
-        IF_X86_ELSE(IF_X64_ELSE(EM_X86_64, EM_386), IF_X64_ELSE(EM_AARCH64, EM_ARM)))
+    /* i#1684: We do allow mixing arches of the same bitwidth. See the i#1684
+     * comment in is_elf_so_header_common().
+     */
+    if (
+#        ifdef X64
+        elf_hdr->e_machine != EM_X86_64 && elf_hdr->e_machine != EM_AARCH64
+#        else
+        elf_hdr->e_machine != EM_386 && elf_hdr->e_machine != EM_ARM
+#        endif
+    )
         return false;
     if (elf_hdr->e_ehsize != sizeof(ELF_HEADER_TYPE))
         return false;
@@ -1707,13 +1912,18 @@ relocate_dynamorio(byte *dr_map, size_t dr_size, byte *sp)
     const char **env = (const char **)sp + argc + 2;
     os_privmod_data_t opd = { { 0 } };
 
-    os_page_size_init(env, true);
+    /* We can't use PAGE_SIZE as that may require relocations to access. */
+    const int min_page_size = 4096;
 
     if (dr_map == NULL) {
+        /* We can't start with the address of relocate_dynamorio or something as that
+         * may require relocations to access!
+         */
+        GET_CUR_PC(dr_map);
         /* we do not know where dynamorio is, so check backward page by page */
-        dr_map = (app_pc)ALIGN_BACKWARD((ptr_uint_t)relocate_dynamorio, PAGE_SIZE);
+        dr_map = (app_pc)ALIGN_BACKWARD(dr_map, min_page_size);
         while (dr_map != NULL && !privload_mem_is_elf_so_header(dr_map)) {
-            dr_map -= PAGE_SIZE;
+            dr_map -= min_page_size;
         }
     }
     if (dr_map == NULL)
@@ -1722,6 +1932,8 @@ relocate_dynamorio(byte *dr_map, size_t dr_size, byte *sp)
     /* Relocate it */
     if (privload_get_os_privmod_data(dr_map, &opd))
         privload_early_relocate_os_privmod_data(&opd, dr_map);
+
+    os_page_size_init(env, true);
 }
 
 /* i#1227: on a conflict with the app we reload ourselves.
@@ -1793,7 +2005,7 @@ reload_dynamorio(void **init_sp, app_pc conflict_start, app_pc conflict_end)
     /* Now load the 2nd libdynamorio.so */
     dr_map = elf_loader_map_phdrs(&dr_ld, false /*!fixed*/, os_map_file, os_unmap_file,
                                   os_set_protection, privload_check_new_map_bounds,
-                                  privload_map_flags(0 /*!reachable*/));
+                                  memset, privload_map_flags(0 /*!reachable*/));
     ASSERT(dr_map != NULL);
     ASSERT(is_elf_so_header(dr_map, 0));
 
@@ -1916,6 +2128,11 @@ privload_early_inject(void **sp, byte *old_libdr_base, size_t old_libdr_size)
              "Failed to read app ELF headers.  Check path and "
              "architecture.");
 
+    /* Initialize DR's options to avoid syslogs in get_dynamo_library_bounds() and
+     * for the -xarch_root option below.
+     */
+    dynamorio_app_init_part_one_options();
+
     /* Find range of app */
     exe_map = module_vaddr_from_prog_header((app_pc)exe_ld.phdrs, exe_ld.ehdr->e_phnum,
                                             NULL, &exe_end);
@@ -1945,8 +2162,8 @@ privload_early_inject(void **sp, byte *old_libdr_base, size_t old_libdr_size)
                                    true,
                                    /* ensure there's space for the brk */
                                    map_exe_file_and_brk, os_unmap_file, os_set_protection,
-                                   privload_check_new_map_bounds,
-                                   privload_map_flags(0 /*!reachable*/));
+                                   privload_check_new_map_bounds, memset,
+                                   privload_map_flags(MODLOAD_IS_APP /*!reachable*/));
     apicheck(exe_map != NULL,
              "Failed to load application.  "
              "Check path and architecture.");
@@ -1986,13 +2203,27 @@ privload_early_inject(void **sp, byte *old_libdr_base, size_t old_libdr_size)
 
     interp = elf_loader_find_pt_interp(&exe_ld);
     if (interp != NULL) {
+        char buf[MAXIMUM_PATH];
+        if (!IS_STRING_OPTION_EMPTY(xarch_root) && !os_file_exists(interp, false)) {
+            string_option_read_lock();
+            snprintf(buf, BUFFER_SIZE_ELEMENTS(buf), "%s/%s", DYNAMO_OPTION(xarch_root),
+                     interp);
+            NULL_TERMINATE_BUFFER(buf);
+            string_option_read_unlock();
+            if (os_file_exists(buf, false)) {
+                LOG(GLOBAL, LOG_SYSCALLS, 2, "replacing interpreter |%s| with |%s|\n",
+                    interp, buf);
+                interp = buf;
+            }
+        }
         /* Load the ELF pointed at by PT_INTERP, usually ld.so. */
         elf_loader_t interp_ld;
         success = elf_loader_read_headers(&interp_ld, interp);
         apicheck(success, "Failed to read ELF interpreter headers.");
         interp_map = elf_loader_map_phdrs(
             &interp_ld, false /* fixed */, os_map_file, os_unmap_file, os_set_protection,
-            privload_check_new_map_bounds, privload_map_flags(0 /*!reachable*/));
+            privload_check_new_map_bounds, memset,
+            privload_map_flags(MODLOAD_IS_APP /*!reachable*/));
         apicheck(interp_map != NULL && is_elf_so_header(interp_map, 0),
                  "Failed to map ELF interpreter.");
         /* On Android, the system loader /system/bin/linker sets itself
@@ -2013,13 +2244,15 @@ privload_early_inject(void **sp, byte *old_libdr_base, size_t old_libdr_size)
 
     elf_loader_destroy(&exe_ld);
 
-    /* Initialize DR *after* we map the app image.  This is consistent with our
-     * old behavior, and allows the client to do things like call
+    /* Initialize the rest of DR *after* we map the app and interp images.  This is
+     * consistent with our old behavior, and allows the client to do things like call
      * dr_get_proc_address() on the app from dr_client_main().  We let
      * find_executable_vm_areas re-discover the mappings we made for the app and
-     * interp images.
+     * interp images.  We do not do the full init before mapping the interp image
+     * as it complicates recording the mappings for the interp.
      */
-    dynamorio_app_init();
+    if (dynamorio_app_init_part_two_finalize() != SUCCESS)
+        apicheck(false, "Failed to initialize part two.");
 
     LOG(GLOBAL, LOG_TOP, 1, "early injected into app with this cmdline:\n");
     DOLOG(1, LOG_TOP, {
@@ -2055,4 +2288,15 @@ privload_early_inject(void **sp, byte *old_libdr_base, size_t old_libdr_size)
 #    endif /* !defined(STANDALONE_UNIT_TEST) && !defined(STATIC_LIBRARY) */
 #else
 /* XXX i#1285: implement MacOS private loader */
+void
+relocate_dynamorio(byte *dr_map, size_t dr_size, byte *sp)
+{
+    ASSERT_NOT_IMPLEMENTED(false);
+}
+
+void
+privload_early_inject(void **sp, byte *old_libdr_base, size_t old_libdr_size)
+{
+    ASSERT_NOT_IMPLEMENTED(false);
+}
 #endif

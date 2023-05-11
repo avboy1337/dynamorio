@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2011-2019 Google, Inc.  All rights reserved.
+ * Copyright (c) 2011-2022 Google, Inc.  All rights reserved.
  * Copyright (c) 2000-2010 VMware, Inc.  All rights reserved.
  * **********************************************************/
 
@@ -65,7 +65,12 @@
  * sigframe_rt_t as well (which currently is not labeled as a sigcontext_t).  We may
  * want to use a similar strategy to handle the different struct sizes for both.
  */
+#        if defined(AARCH64)
+typedef _STRUCT_MCONTEXT64 sigcontext_t;
+#        else
 typedef _STRUCT_MCONTEXT_AVX64 sigcontext_t; /* == __darwin_mcontext_avx64 */
+#        endif
+
 #    else
 /* TODO i#1979/i#1312: Like for X64, this should become _STRUCT_MCONTEXT_AVX512_32 ==
  * __darwin_mcontext_avx512_32.
@@ -134,16 +139,50 @@ typedef kernel_sigcontext_t sigcontext_t;
 #    define SC_SYSNUM_REG SC_XAX
 #    define SC_RETURN_REG SC_XAX
 #elif defined(AARCH64)
-/* FIXME i#1569: NYI */
+#    ifdef MACOS
+#        define SC_FIELD_AARCH64(n) SC_FIELD(x[n])
+#        define SC_LR SC_FIELD(lr)
+#        define SC_XFLAGS SC_FIELD(cpsr)
+#        define SC_SYSNUM_REG SC_FIELD_AARCH64(16)
+#    else
+#        define SC_FIELD_AARCH64(n) SC_FIELD(regs[n])
+#        define SC_LR SC_FIELD_AARCH64(30)
+#        define SC_XFLAGS SC_FIELD(pstate)
+#        define SC_SYSNUM_REG SC_FIELD_AARCH64(8)
+#    endif
+#    define SC_R0 SC_FIELD_AARCH64(0)
+#    define SC_R1 SC_FIELD_AARCH64(1)
+#    define SC_R2 SC_FIELD_AARCH64(2)
+#    define SC_R3 SC_FIELD_AARCH64(3)
+#    define SC_R4 SC_FIELD_AARCH64(4)
+#    define SC_R5 SC_FIELD_AARCH64(5)
+#    define SC_R6 SC_FIELD_AARCH64(6)
+#    define SC_R7 SC_FIELD_AARCH64(7)
+#    define SC_R8 SC_FIELD_AARCH64(8)
+#    define SC_R9 SC_FIELD_AARCH64(9)
+#    define SC_R10 SC_FIELD_AARCH64(10)
+#    define SC_R11 SC_FIELD_AARCH64(11)
+#    define SC_R12 SC_FIELD_AARCH64(12)
+#    define SC_R13 SC_FIELD_AARCH64(13)
+#    define SC_R14 SC_FIELD_AARCH64(14)
+#    define SC_R15 SC_FIELD_AARCH64(15)
+#    define SC_R16 SC_FIELD_AARCH64(16)
+#    define SC_R17 SC_FIELD_AARCH64(17)
+#    define SC_R18 SC_FIELD_AARCH64(18)
+#    define SC_R19 SC_FIELD_AARCH64(19)
+#    define SC_R20 SC_FIELD_AARCH64(20)
+#    define SC_R21 SC_FIELD_AARCH64(21)
+#    define SC_R22 SC_FIELD_AARCH64(22)
+#    define SC_R23 SC_FIELD_AARCH64(23)
+#    define SC_R24 SC_FIELD_AARCH64(24)
+#    define SC_R25 SC_FIELD_AARCH64(25)
+#    define SC_R26 SC_FIELD_AARCH64(26)
+#    define SC_R27 SC_FIELD_AARCH64(27)
+#    define SC_R28 SC_FIELD_AARCH64(28)
+#    define SC_FP SC_FIELD_AARCH64(29)
 #    define SC_XIP SC_FIELD(pc)
-#    define SC_FP SC_FIELD(regs[29])
-#    define SC_R0 SC_FIELD(regs[0])
-#    define SC_R1 SC_FIELD(regs[1])
-#    define SC_R2 SC_FIELD(regs[2])
-#    define SC_LR SC_FIELD(regs[30])
 #    define SC_XSP SC_FIELD(sp)
-#    define SC_XFLAGS SC_FIELD(pstate)
-#    define SC_SYSNUM_REG SC_FIELD(regs[8])
+#    define SC_RETURN_REG SC_R0
 #elif defined(ARM)
 #    define SC_XIP SC_FIELD(arm_pc)
 #    define SC_FP SC_FIELD(arm_fp)
@@ -165,6 +204,21 @@ typedef kernel_sigcontext_t sigcontext_t;
 #    define SC_XFLAGS SC_FIELD(arm_cpsr)
 #    define SC_SYSNUM_REG SC_R7
 #    define SC_RETURN_REG SC_R0
+#elif defined(RISCV64)
+#    define SC_A0 SC_FIELD(sc_regs.a0)
+#    define SC_A1 SC_FIELD(sc_regs.a1)
+#    define SC_A2 SC_FIELD(sc_regs.a2)
+#    define SC_A3 SC_FIELD(sc_regs.a3)
+#    define SC_A4 SC_FIELD(sc_regs.a4)
+#    define SC_A5 SC_FIELD(sc_regs.a5)
+#    define SC_A6 SC_FIELD(sc_regs.a6)
+#    define SC_A7 SC_FIELD(sc_regs.a7)
+#    define SC_FP SC_FIELD(sc_regs.s0)
+#    define SC_RA SC_FIELD(sc_regs.ra)
+#    define SC_XIP SC_FIELD(sc_regs.pc)
+#    define SC_XSP SC_FIELD(sc_regs.sp)
+#    define SC_SYSNUM_REG SC_A7
+#    define SC_RETURN_REG SC_A0
 #endif /* X86/ARM */
 
 #endif /* _OS_PUBLIC_H_ 1 */

@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2013-2019 Google, Inc.  All rights reserved.
+ * Copyright (c) 2013-2020 Google, Inc.  All rights reserved.
  * Copyright (c) 2001-2010 VMware, Inc.  All rights reserved.
  * **********************************************************/
 
@@ -93,10 +93,8 @@ test_cpuid()
 {
 #    ifdef X86
     int cpuid_res[4] = { 0 };
-#    endif
     print_file(STDERR, "testing asm cpuid\n");
-    EXPECT(cpuid_supported(), IF_X86_ELSE(true, false));
-#    ifdef X86
+    EXPECT(cpuid_supported(), true);
     our_cpuid(cpuid_res, 0, 0); /* get vendor id */
     /* cpuid_res[1..3] stores vendor info like "GenuineIntel" or "AuthenticAMD" for X86 */
     EXPECT_NE(cpuid_res[1], 0);
@@ -105,7 +103,7 @@ test_cpuid()
 #    endif
 }
 
-#    ifdef __AVX__
+#    if !defined(DR_HOST_NOT_TARGET) && defined(__AVX__)
 
 static void
 unit_test_get_ymm_caller_saved()
@@ -393,7 +391,7 @@ unit_test_asm(dcontext_t *dc)
     print_file(STDERR, "testing asm\n");
     test_call_switch_stack(dc);
     test_cpuid();
-#    ifdef UNIX
+#    if defined(UNIX) && !defined(DR_HOST_NOT_TARGET)
 #        ifdef __AVX__
     unit_test_get_ymm_caller_saved();
 #        endif

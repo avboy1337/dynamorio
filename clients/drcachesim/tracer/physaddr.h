@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2015-2020 Google, Inc.  All rights reserved.
+ * Copyright (c) 2015-2022 Google, Inc.  All rights reserved.
  * **********************************************************/
 
 /*
@@ -36,26 +36,79 @@
 #ifndef _PHYSADDR_H_
 #define _PHYSADDR_H_ 1
 
-#include <fstream>
-#include <unordered_map>
+#include <atomic>
+#include "dr_api.h"
+#include "hashtable.h"
 #include "../common/trace_entry.h"
 
+// This class is not thread-safe: the caller should create a separate instance
+// per thread.
 class physaddr_t {
 public:
     physaddr_t();
+    ~physaddr_t();
     bool
     init();
-    addr_t
-    virtual2physical(addr_t virt);
+
+    // If translation from "virt" to its corresponding physical address is
+    // successful, returns true and stores the physical address in "phys".
+    // 0 is a possible valid physical address, as are large values beyond
+    // the amount of RAM due to holes in the physical address space.
+    // Returns in "from_cache" whether the physical address had been queried before
+    // and was available in a local cache (which is cleared at -virt2phys_freq).
+    bool
+    virtual2physical(void *drcontext, addr_t virt, OUT addr_t *phys,
+                     OUT bool *from_cache = nullptr);
+
+    // This must be called once prior to any instance variables.
+    // (If this class weren't used in a DR client context we could use a C++
+    // mutex or pthread do-once but those are not safe here.)
+    static bool
+    global_init();
 
 private:
-    // Assumed to be single-threaded
 #ifdef LINUX
-    addr_t last_vpage_;
-    addr_t last_ppage_;
+    inline addr_t
+    page_start(addr_t addr)
+    {
+        return ALIGN_BACKWARD(addr, page_size_);
+    }
+    inline uint64_t
+    page_offs(addr_t addr)
+    {
+        return addr & ((1 << page_bits_) - 1);
+    }
+
+    size_t page_size_;
+    int page_bits_;
+    static constexpr int NUM_CACHE = 8;
+    addr_t last_vpage_[NUM_CACHE];
+    addr_t last_ppage_[NUM_CACHE];
+    // FIFO replacement.
+    int cache_idx_;
+    // TODO i#4014: An app with thousands of threads might hit open file limits,
+    // and even a hundred threads will use up DR's private FD limit and push
+    // other files into potential app conflicts.
+    // Sharing the descriptor would require locks, however.  Evaluating
+    // how best to do that (maybe the caching will reduce the contention enough)
+    // is future work.
     int fd_;
-    std::unordered_map<addr_t, addr_t> v2p_;
+    // We would use std::unordered_map, but that is not compatible with
+    // statically linking drmemtrace into an app.
+    // The drcontainers hashtable is too slow due to the extra dereferences:
+    // we need an open-addressed table.
+    void *v2p_;
+    // We must pass the same context to free as we used to allocate.
+    void *drcontext_;
+    static constexpr addr_t PAGE_INVALID = (addr_t)-1;
+    // With hashtable_t nullptr is how non-existence is shown, so we store
+    // an actual 0 address (can happen for physical) as this sentinel.
+    static constexpr addr_t ZERO_ADDR_PAYLOAD = PAGE_INVALID;
     unsigned int count_;
+    uint64_t num_hit_cache_;
+    uint64_t num_hit_table_;
+    uint64_t num_miss_;
+    static std::atomic<bool> has_privileges_;
 #endif
 };
 

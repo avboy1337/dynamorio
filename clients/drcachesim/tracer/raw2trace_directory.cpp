@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2017-2020 Google, Inc.  All rights reserved.
+ * Copyright (c) 2017-2022 Google, Inc.  All rights reserved.
  * **********************************************************/
 
 /*
@@ -48,9 +48,6 @@
 #    define WIN32_LEAN_AND_MEAN
 #    include <windows.h>
 #endif
-#ifdef HAS_ZLIB
-#    include "common/gzip_ostream.h"
-#endif
 
 #include "dr_api.h"
 #include "dr_frontend.h"
@@ -58,6 +55,20 @@
 #include "raw2trace_directory.h"
 #include "directory_iterator.h"
 #include "utils.h"
+#ifdef HAS_ZLIB
+#    include "common/gzip_istream.h"
+#    include "common/gzip_ostream.h"
+#    include "common/zlib_istream.h"
+#    ifdef HAS_ZIP
+#        include "common/zipfile_ostream.h"
+#    endif
+#endif
+#ifdef HAS_SNAPPY
+#    include "common/snappy_istream.h"
+#endif
+#ifdef HAS_LZ4
+#    include "common/lz4_istream.h"
+#endif
 
 #define FATAL_ERROR(msg, ...)                               \
     do {                                                    \
@@ -72,6 +83,7 @@
             FATAL_ERROR(msg, ##__VA_ARGS__); \
     } while (0)
 
+#undef VPRINT
 #define VPRINT(level, ...)                     \
     do {                                       \
         if (this->verbosity_ >= (level)) {     \
@@ -105,12 +117,50 @@ raw2trace_directory_t::open_thread_log_file(const char *basename)
           basename);
     // Skip the auxiliary files.
     if (strcmp(basename, DRMEMTRACE_MODULE_LIST_FILENAME) == 0 ||
-        strcmp(basename, DRMEMTRACE_FUNCTION_LIST_FILENAME) == 0)
+        strcmp(basename, DRMEMTRACE_FUNCTION_LIST_FILENAME) == 0 ||
+        strcmp(basename, DRMEMTRACE_ENCODING_FILENAME) == 0)
         return "";
     // Skip any non-.raw in case someone put some other file in there.
-    const char *basename_pre_suffix = strrchr(basename, '.');
-    if (basename_pre_suffix != nullptr)
-        basename_pre_suffix = strstr(basename_pre_suffix, OUTFILE_SUFFIX);
+    const char *basename_dot = strrchr(basename, '.');
+    if (basename_dot == nullptr)
+        return "";
+    const char *basename_pre_suffix = nullptr;
+#ifdef HAS_ZLIB
+    bool is_gzipped = false, is_zlib = false;
+    basename_pre_suffix =
+        strstr(basename_dot - strlen(OUTFILE_SUFFIX_GZ), OUTFILE_SUFFIX_GZ);
+    if (basename_pre_suffix != nullptr) {
+        is_gzipped = true;
+    } else {
+        basename_pre_suffix =
+            strstr(basename_dot - strlen(OUTFILE_SUFFIX_ZLIB), OUTFILE_SUFFIX_ZLIB);
+        if (basename_pre_suffix != nullptr) {
+            is_zlib = true;
+        }
+    }
+#endif
+#ifdef HAS_SNAPPY
+    bool is_snappy = false;
+    if (basename_pre_suffix == nullptr) {
+        basename_pre_suffix =
+            strstr(basename_dot - strlen(OUTFILE_SUFFIX_SZ), OUTFILE_SUFFIX_SZ);
+        if (basename_pre_suffix != nullptr) {
+            is_snappy = true;
+        }
+    }
+#endif
+#ifdef HAS_LZ4
+    bool is_lz4 = false;
+    if (basename_pre_suffix == nullptr) {
+        basename_pre_suffix =
+            strstr(basename_dot - strlen(OUTFILE_SUFFIX_LZ4), OUTFILE_SUFFIX_LZ4);
+        if (basename_pre_suffix != nullptr) {
+            is_lz4 = true;
+        }
+    }
+#endif
+    if (basename_pre_suffix == nullptr)
+        basename_pre_suffix = strstr(basename_dot, OUTFILE_SUFFIX);
     if (basename_pre_suffix == nullptr)
         return "";
     if (dr_snprintf(path, BUFFER_SIZE_ELEMENTS(path), "%s%s%s", indir_.c_str(), DIRSEP,
@@ -118,7 +168,30 @@ raw2trace_directory_t::open_thread_log_file(const char *basename)
         return "Failed to get full path of file " + std::string(basename);
     }
     NULL_TERMINATE_BUFFER(path);
-    in_files_.push_back(new std::ifstream(path, std::ifstream::binary));
+    std::istream *ifile = nullptr;
+#ifdef HAS_ZLIB
+    if (is_gzipped)
+        ifile = new gzip_istream_t(path);
+    else if (is_zlib)
+        ifile = new zlib_istream_t(path);
+#endif
+#ifdef HAS_SNAPPY
+    if (is_snappy) {
+        if (ifile != nullptr)
+            return "Internal Error in determining input file type.";
+        ifile = new snappy_istream_t(path);
+    }
+#endif
+#ifdef HAS_LZ4
+    if (is_lz4) {
+        if (ifile != nullptr)
+            return "Internal Error in determining input file type.";
+        ifile = new lz4_istream_t(path);
+    }
+#endif
+    if (ifile == nullptr)
+        ifile = new std::ifstream(path, std::ifstream::binary);
+    in_files_.push_back(ifile);
     if (!(*in_files_.back()))
         return "Failed to open thread log file " + std::string(path);
     std::string error = raw2trace_t::check_thread_file(in_files_.back());
@@ -138,17 +211,70 @@ raw2trace_directory_t::open_thread_log_file(const char *basename)
                     DIRSEP, outname, TRACE_SUFFIX) <= 0) {
         return "Failed to compute full path of output file for " + std::string(basename);
     }
-    std::ostream *ofile;
-#ifdef HAS_ZLIB
-    ofile = new gzip_ostream_t(path);
+#ifdef HAS_ZIP
+    archive_ostream_t *ofile = new zipfile_ostream_t(path);
+    out_archives_.push_back(ofile);
+    if (!(*out_archives_.back()))
+        return "Failed to open output file " + std::string(path);
 #else
+    std::ostream *ofile;
+#    ifdef HAS_ZLIB
+    ofile = new gzip_ostream_t(path);
+#    else
     ofile = new std::ofstream(path, std::ofstream::binary);
-#endif
+#    endif
     out_files_.push_back(ofile);
     if (!(*out_files_.back()))
         return "Failed to open output file " + std::string(path);
+#endif
     VPRINT(1, "Opened output file %s\n", path);
     return "";
+}
+
+std::string
+raw2trace_directory_t::open_serial_schedule_file()
+{
+#ifdef HAS_ZLIB
+    const char *suffix = ".gz";
+#else
+    const char *suffix = "";
+#endif
+    char path[MAXIMUM_PATH];
+    if (dr_snprintf(path, BUFFER_SIZE_ELEMENTS(path), "%s%s%s%s", outdir_.c_str(), DIRSEP,
+                    DRMEMTRACE_SERIAL_SCHEDULE_FILENAME, suffix) <= 0) {
+        return "Failed to compute full path for " +
+            std::string(DRMEMTRACE_SERIAL_SCHEDULE_FILENAME);
+    }
+#ifdef HAS_ZLIB
+    serial_schedule_file_ = new gzip_ostream_t(path);
+#else
+    serial_schedule_file_ = new std::ofstream(path, std::ofstream::binary);
+#endif
+    if (!*serial_schedule_file_)
+        return "Failed to open serial schedule file " + std::string(path);
+    VPRINT(1, "Opened serial schedule file %s\n", path);
+    return "";
+}
+
+std::string
+raw2trace_directory_t::open_cpu_schedule_file()
+{
+#ifndef HAS_ZIP
+    // Not supported; just leave cpu_schedule_file_ as nullptr.
+    return "";
+#else
+    char path[MAXIMUM_PATH];
+    if (dr_snprintf(path, BUFFER_SIZE_ELEMENTS(path), "%s%s%s", outdir_.c_str(), DIRSEP,
+                    DRMEMTRACE_CPU_SCHEDULE_FILENAME) <= 0) {
+        return "Failed to compute full path for " +
+            std::string(DRMEMTRACE_CPU_SCHEDULE_FILENAME);
+    }
+    cpu_schedule_file_ = new zipfile_ostream_t(path);
+    if (!*cpu_schedule_file_)
+        return "Failed to open cpu schedule file " + std::string(path);
+    VPRINT(1, "Opened cpu schedule file %s\n", path);
+    return "";
+#endif
 }
 
 std::string
@@ -167,6 +293,25 @@ raw2trace_directory_t::read_module_file(const std::string &modfilename)
     return "";
 }
 
+bool
+raw2trace_directory_t::is_window_subdir(const std::string &dir)
+{
+    return dir.rfind(WINDOW_SUBDIR_PREFIX) != std::string::npos &&
+        dir.rfind(WINDOW_SUBDIR_PREFIX) >= dir.size() - strlen(WINDOW_SUBDIR_FIRST);
+}
+
+std::string
+raw2trace_directory_t::window_subdir_if_present(const std::string &dir)
+{
+    // Support window subdirs.  If the base is passed, target the first.
+    if (is_window_subdir(dir))
+        return dir;
+    std::string windir = dir + std::string(DIRSEP) + WINDOW_SUBDIR_FIRST;
+    if (directory_iterator_t::is_directory(windir))
+        return windir;
+    return dir;
+}
+
 std::string
 raw2trace_directory_t::tracedir_from_rawdir(const std::string &rawdir_in)
 {
@@ -183,10 +328,11 @@ raw2trace_directory_t::tracedir_from_rawdir(const std::string &rawdir_in)
     if (rawdir.size() > trace_sub.size() &&
         rawdir.compare(rawdir.size() - trace_sub.size(), trace_sub.size(), trace_sub) ==
             0)
-        return rawdir;
-    // If it ends in "/raw", replace with "/trace".
-    if (rawdir.size() > raw_sub.size() &&
-        rawdir.compare(rawdir.size() - raw_sub.size(), raw_sub.size(), raw_sub) == 0) {
+        return window_subdir_if_present(rawdir);
+    // If it ends in "/raw" or a window subdir, replace with "/trace".
+    if ((rawdir.size() > raw_sub.size() &&
+         rawdir.compare(rawdir.size() - raw_sub.size(), raw_sub.size(), raw_sub) == 0) ||
+        is_window_subdir(rawdir)) {
         std::string tracedir = rawdir;
         size_t pos = rawdir.rfind(raw_sub);
         if (pos == std::string::npos)
@@ -198,7 +344,7 @@ raw2trace_directory_t::tracedir_from_rawdir(const std::string &rawdir_in)
     // If it contains a "/raw" or "/trace" subdir, add "/trace" to it.
     if (directory_iterator_t::is_directory(rawdir + raw_sub) ||
         directory_iterator_t::is_directory(rawdir + trace_sub)) {
-        return rawdir + trace_sub;
+        return window_subdir_if_present(rawdir + trace_sub);
     }
     // Use it directly.
     return rawdir;
@@ -219,10 +365,24 @@ raw2trace_directory_t::initialize(const std::string &indir, const std::string &o
     if (!directory_iterator_t::is_directory(indir_))
         return "Directory does not exist: " + indir_;
     // Support passing both base dir and raw/ subdir.
-    if (indir_.rfind(OUTFILE_SUBDIR) == std::string::npos ||
-        indir_.rfind(OUTFILE_SUBDIR) < indir_.size() - strlen(OUTFILE_SUBDIR)) {
+    if (!is_window_subdir(indir_) &&
+        (indir_.rfind(OUTFILE_SUBDIR) == std::string::npos ||
+         indir_.rfind(OUTFILE_SUBDIR) < indir_.size() - strlen(OUTFILE_SUBDIR))) {
         indir_ += std::string(DIRSEP) + OUTFILE_SUBDIR;
     }
+    std::string modfile_dir = indir_;
+    // Support window subdirs.
+    indir_ = window_subdir_if_present(indir_);
+    if (is_window_subdir(indir_)) {
+        // If we're operating on a specific window, point at the parent for the modfile.
+        // Windows dr_open_file() doesn't like "..".
+        modfile_dir = indir_;
+        auto pos = modfile_dir.rfind(DIRSEP);
+        if (pos == std::string::npos)
+            return "Window subdir missing slash";
+        modfile_dir.erase(pos);
+    }
+
     // Support a default outdir_.
     if (outdir_.empty()) {
         outdir_ = tracedir_from_rawdir(indir_);
@@ -233,8 +393,28 @@ raw2trace_directory_t::initialize(const std::string &indir, const std::string &o
         }
     }
     std::string modfilename =
-        indir_ + std::string(DIRSEP) + DRMEMTRACE_MODULE_LIST_FILENAME;
+        modfile_dir + std::string(DIRSEP) + DRMEMTRACE_MODULE_LIST_FILENAME;
     std::string err = read_module_file(modfilename);
+    if (!err.empty())
+        return err;
+
+    std::string encoding_filename =
+        modfile_dir + std::string(DIRSEP) + DRMEMTRACE_ENCODING_FILENAME;
+    // Older traces do not have encoding files.
+    // If we had the version we could check OFFLINE_FILE_VERSION_ENCODINGS but
+    // we don't currently read that; raw2trace will check it for us.
+    // TODO i#2062: When raw2trace support is added, check the version.
+    if (dr_file_exists(encoding_filename.c_str())) {
+        encoding_file_ = dr_open_file(encoding_filename.c_str(), DR_FILE_READ);
+        if (encoding_file_ == INVALID_FILE)
+            return "Failed to open encoding file " + encoding_filename;
+    }
+
+    // Open the schedule output files.
+    err = open_serial_schedule_file();
+    if (!err.empty())
+        return err;
+    err = open_cpu_schedule_file();
     if (!err.empty())
         return err;
 
@@ -275,6 +455,8 @@ raw2trace_directory_t::~raw2trace_directory_t()
         delete[] modfile_bytes_;
     if (modfile_ != INVALID_FILE)
         dr_close_file(modfile_);
+    if (encoding_file_ != INVALID_FILE)
+        dr_close_file(encoding_file_);
     for (std::vector<std::istream *>::iterator fi = in_files_.begin();
          fi != in_files_.end(); ++fi) {
         delete *fi;
@@ -283,5 +465,12 @@ raw2trace_directory_t::~raw2trace_directory_t()
          fo != out_files_.end(); ++fo) {
         delete *fo;
     }
+    for (auto *archive : out_archives_) {
+        delete archive;
+    }
+    if (serial_schedule_file_ != nullptr)
+        delete serial_schedule_file_;
+    if (cpu_schedule_file_ != nullptr)
+        delete cpu_schedule_file_;
     dr_standalone_exit();
 }

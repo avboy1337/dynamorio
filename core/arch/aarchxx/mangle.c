@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2014-2020 Google, Inc.  All rights reserved.
+ * Copyright (c) 2014-2022 Google, Inc.  All rights reserved.
  * Copyright (c) 2016 ARM Limited. All rights reserved.
  * **********************************************************/
 
@@ -33,7 +33,7 @@
 
 #include "../globals.h"
 #include "arch.h"
-#include "instr_create.h"
+#include "instr_create_shared.h"
 #include "instrument.h" /* instrlist_meta_preinsert */
 #include "../clean_call_opt.h"
 #include "disassemble.h"
@@ -899,9 +899,7 @@ insert_reachable_cti(dcontext_t *dcontext, instrlist_t *ilist, instr_t *where,
                            opnd_create_reg(scratch), ilist, where, NULL, NULL);
     /* even if a call and not a jmp, we can skip this if it doesn't return */
     if (!jmp && returns) {
-        PRE(ilist, where,
-            IF_AARCH64_ELSE(INSTR_CREATE_blr,
-                            INSTR_CREATE_blx_ind)(dcontext, opnd_create_reg(scratch)));
+        PRE(ilist, where, XINST_CREATE_call_reg(dcontext, opnd_create_reg(scratch)));
     } else {
         PRE(ilist, where, XINST_CREATE_jump_reg(dcontext, opnd_create_reg(scratch)));
     }
@@ -969,7 +967,7 @@ insert_out_of_line_context_switch(dcontext_t *dcontext, instrlist_t *ilist,
 /*###########################################################################
  *###########################################################################
  *
- *   M A N G L I N G   R O U T I N E S
+ * MANGLING ROUTINES
  */
 
 /* forward declaration */
@@ -1031,6 +1029,7 @@ insert_save_to_tls_if_necessary(dcontext_t *dcontext, instrlist_t *ilist, instr_
     STATS_INC(non_mbr_spills);
     prev = find_prior_scratch_reg_restore(dcontext, where, &prior_reg);
     if (INTERNAL_OPTION(opt_mangle) > 0 && prev != NULL && prior_reg == reg) {
+        /* XXX: This looks only for dr_reg_stolen. */
         ASSERT(instr_is_DR_reg_spill_or_restore(dcontext, prev, &tls, &spill, &prior_reg,
                                                 NULL) &&
                tls && !spill && prior_reg == reg);
@@ -1202,11 +1201,34 @@ mangle_reinstate_it_blocks(dcontext_t *dcontext, instrlist_t *ilist, instr_t *st
 
 #endif /* !AARCH64 */
 
+/* This is *not* a hot-patchable patch: i.e., it is subject to races. */
 void
 patch_mov_immed_arch(dcontext_t *dcontext, ptr_int_t val, byte *pc, instr_t *first,
                      instr_t *last)
 {
-    ASSERT_NOT_IMPLEMENTED(false); /* FIXME i#1551, i#1569 */
+#ifdef AARCH64
+    uint *write_pc = (uint *)vmcode_get_writable_addr(pc);
+    ASSERT(first != NULL && last != NULL);
+    /* We expect OP_movz followed by up to 3 OP_movk. */
+    ASSERT(instr_get_opcode(first) == OP_movz && opnd_is_reg(instr_get_dst(first, 0)));
+    reg_id_t dst_reg = opnd_get_reg(instr_get_dst(first, 0));
+    int instr_count = 1;
+    for (instr_t *inst = instr_get_next(first); inst != NULL;
+         inst = instr_get_next(inst)) {
+        ++instr_count;
+        ASSERT(instr_get_opcode(inst) == OP_movk && opnd_is_reg(instr_get_dst(inst, 0)));
+        if (inst == last)
+            break;
+    }
+    uint *end_pc = insert_mov_imm(write_pc, dst_reg, val);
+    ASSERT(end_pc - write_pc <= instr_count);
+    while (end_pc - write_pc < instr_count) {
+        *end_pc = RAW_NOP_INST;
+        ++end_pc;
+    }
+#else
+    ASSERT_NOT_IMPLEMENTED(false); /* TODO i#1551: NYI */
+#endif
 }
 
 /* Used for fault translation */
@@ -1343,11 +1365,10 @@ mangle_direct_call(dcontext_t *dcontext, instrlist_t *ilist, instr_t *instr,
                    instr_t *next_instr, bool mangle_calls, uint flags)
 {
 #ifdef AARCH64
-    ptr_int_t target, retaddr;
+    ptr_int_t retaddr;
 
     ASSERT(instr_get_opcode(instr) == OP_bl);
     ASSERT(opnd_is_pc(instr_get_target(instr)));
-    target = (ptr_int_t)opnd_get_pc(instr_get_target(instr));
     retaddr = get_call_return_address(dcontext, ilist, instr);
     insert_mov_immed_ptrsz(dcontext, retaddr, opnd_create_reg(DR_REG_X30), ilist, instr,
                            NULL, NULL);
@@ -1425,7 +1446,8 @@ mangle_indirect_call(dcontext_t *dcontext, instrlist_t *ilist, instr_t *instr,
                      instr_t *next_instr, bool mangle_calls, uint flags)
 {
 #ifdef AARCH64
-    ASSERT(instr_get_opcode(instr) == OP_blr);
+    int opc = instr_get_opcode(instr);
+    ASSERT(instr_is_call_indirect(instr));
     PRE(ilist, instr,
         instr_create_save_to_tls(dcontext, IBL_TARGET_REG, IBL_TARGET_SLOT));
     ASSERT(opnd_is_reg(instr_get_target(instr)));
@@ -1437,6 +1459,13 @@ mangle_indirect_call(dcontext_t *dcontext, instrlist_t *ilist, instr_t *instr,
         PRE(ilist, instr,
             XINST_CREATE_move(dcontext, opnd_create_reg(IBL_TARGET_REG),
                               instr_get_target(instr)));
+    }
+    switch (opc) {
+    case OP_blraa:
+    case OP_blrab:
+    case OP_blraaz:
+    case OP_blrabz:
+        PRE(ilist, instr, INSTR_CREATE_xpaci(dcontext, opnd_create_reg(IBL_TARGET_REG)));
     }
     insert_mov_immed_ptrsz(dcontext, get_call_return_address(dcontext, ilist, instr),
                            opnd_create_reg(DR_REG_X30), ilist, next_instr, NULL, NULL);
@@ -1499,26 +1528,39 @@ instr_t *
 mangle_indirect_jump(dcontext_t *dcontext, instrlist_t *ilist, instr_t *instr,
                      instr_t *next_instr, uint flags)
 {
+    int opc = instr_get_opcode(instr);
 #ifdef AARCH64
-    ASSERT(instr_get_opcode(instr) == OP_br || instr_get_opcode(instr) == OP_ret);
+    ASSERT((instr_branch_type(instr) == (LINK_INDIRECT | LINK_JMP)) ||
+           (instr_branch_type(instr) == (LINK_INDIRECT | LINK_RETURN)));
     PRE(ilist, instr,
         instr_create_save_to_tls(dcontext, IBL_TARGET_REG, IBL_TARGET_SLOT));
-    ASSERT(opnd_is_reg(instr_get_target(instr)));
-    if (opnd_same(instr_get_target(instr), opnd_create_reg(dr_reg_stolen))) {
+    opnd_t target = instr_get_target(instr);
+    ASSERT(opnd_is_reg(target));
+
+    if (opnd_same(target, opnd_create_reg(dr_reg_stolen))) {
         /* if the target reg is dr_reg_stolen, the app value is in TLS */
         PRE(ilist, instr,
             instr_create_restore_from_tls(dcontext, IBL_TARGET_REG, TLS_REG_STOLEN_SLOT));
     } else {
         PRE(ilist, instr,
-            XINST_CREATE_move(dcontext, opnd_create_reg(IBL_TARGET_REG),
-                              instr_get_target(instr)));
+            XINST_CREATE_move(dcontext, opnd_create_reg(IBL_TARGET_REG), target));
     }
+
+    switch (opc) {
+    case OP_retaa:
+    case OP_retab:
+    case OP_braa:
+    case OP_brab:
+    case OP_braaz:
+    case OP_brabz:
+        PRE(ilist, instr, INSTR_CREATE_xpaci(dcontext, opnd_create_reg(IBL_TARGET_REG)));
+    }
+
     instrlist_remove(ilist, instr); /* remove OP_br or OP_ret */
     instr_destroy(dcontext, instr);
     return next_instr;
 #else
     bool remove_instr = false;
-    int opc = instr_get_opcode(instr);
     dr_isa_mode_t isa_mode = instr_get_isa_mode(instr);
     bool in_it = app_instr_is_in_it_block(dcontext, instr);
     instr_t *bound_start = INSTR_CREATE_label(dcontext);
@@ -1546,7 +1588,6 @@ mangle_indirect_jump(dcontext_t *dcontext, instrlist_t *ilist, instr_t *instr,
         opnd_set_size(&memop, OPSZ_VAR_REGLIST);
         instr_set_src(instr, 0, memop);
         instr_set_dst(instr, 0, opnd_create_reg(IBL_TARGET_REG));
-#    ifdef CLIENT_INTERFACE
         /* We target only the typical return instructions: multi-pop here */
         if (TEST(INSTR_CLOBBER_RETADDR, instr->flags) && opc == OP_ldmia) {
             bool writeback = instr_num_srcs(instr) > 1;
@@ -1561,7 +1602,6 @@ mangle_indirect_jump(dcontext_t *dcontext, instrlist_t *ilist, instr_t *instr,
                      XINST_CREATE_store(dcontext, memop, opnd_create_reg(dr_reg_stolen)));
             } /* else not a pop */
         }
-#    endif
     } else if (opc == OP_bx || opc == OP_bxj) {
         ASSERT(opnd_is_reg(instr_get_target(instr)));
         if (opnd_same(instr_get_target(instr), opnd_create_reg(dr_reg_stolen))) {
@@ -1683,7 +1723,6 @@ mangle_indirect_jump(dcontext_t *dcontext, instrlist_t *ilist, instr_t *instr,
              */
             mangle_stolen_reg(dcontext, ilist, instr, immed_next, remove_instr);
         }
-#    ifdef CLIENT_INTERFACE
         /* We target only the typical return instructions: single pop here */
         if (TEST(INSTR_CLOBBER_RETADDR, instr->flags) && opc == OP_ldr) {
             bool writeback = instr_num_srcs(instr) > 1;
@@ -1695,7 +1734,6 @@ mangle_indirect_jump(dcontext_t *dcontext, instrlist_t *ilist, instr_t *instr,
                      XINST_CREATE_store(dcontext, memop, opnd_create_reg(dr_reg_stolen)));
             } /* else not a pop */
         }
-#    endif
     }
     if (instr_is_predicated(instr)) {
         mangle_add_predicated_fall_through(dcontext, ilist, instr, next_instr,
@@ -1712,10 +1750,10 @@ mangle_indirect_jump(dcontext_t *dcontext, instrlist_t *ilist, instr_t *instr,
 #endif
 }
 
-/* Local single-instr-window scratch reg picker.  Only considers r0-r3, so the
- * caller must split up any GPR reg list first.  Assumes we only care about instrs
- * that read or write regs outside of r0-r3, so we'll only fail on instrs that
- * can access 5 GPR's, and again caller should split those up.
+/* Local single-instr-window scratch reg picker.  Only considers r0-r5, so the caller
+ * must split up any GPR reg list first.  Assumes we only care about instrs that read
+ * or write regs outside of r0-r5, so we'll only fail on instrs that can access 7
+ * GPR's, and again caller should split those up.
  *
  * For some use case (e.g., mangle stolen reg), the scratch reg will be
  * used across the app instr, so we cannot pick a dead reg.
@@ -1723,17 +1761,20 @@ mangle_indirect_jump(dcontext_t *dcontext, instrlist_t *ilist, instr_t *instr,
  * Returns REG_NULL if fail to find a scratch reg.
  */
 static reg_id_t
-pick_scratch_reg(dcontext_t *dcontext, instr_t *instr, bool dead_reg_ok,
+pick_scratch_reg(dcontext_t *dcontext, instr_t *instr, reg_id_t do_not_pick_a,
+                 reg_id_t do_not_pick_b, reg_id_t do_not_pick_c, bool dead_reg_ok,
                  ushort *scratch_slot OUT, bool *should_restore OUT)
 {
     reg_id_t reg;
-    ushort slot;
+    ushort slot = 0;
     if (should_restore != NULL)
         *should_restore = true;
 
 #ifndef AARCH64 /* FIXME i#1569: not yet optimized */
     if (find_prior_scratch_reg_restore(dcontext, instr, &reg) != NULL &&
         reg != REG_NULL && !instr_uses_reg(instr, reg) &&
+        !reg_overlap(reg, do_not_pick_a) && !reg_overlap(reg, do_not_pick_b) &&
+        !reg_overlap(reg, do_not_pick_c) &&
         /* Ensure no conflict in scratch regs for PC or stolen reg
          * mangling vs ind br mangling.  We can't just check for mbr b/c
          * of OP_blx.
@@ -1752,7 +1793,8 @@ pick_scratch_reg(dcontext_t *dcontext, instr_t *instr, bool dead_reg_ok,
     if (reg == REG_NULL) {
         for (reg = SCRATCH_REG0, slot = TLS_REG0_SLOT; reg <= SCRATCH_REG_LAST;
              reg++, slot += sizeof(reg_t)) {
-            if (!instr_uses_reg(instr, reg) &&
+            if (!instr_uses_reg(instr, reg) && !reg_overlap(reg, do_not_pick_a) &&
+                !reg_overlap(reg, do_not_pick_b) && !reg_overlap(reg, do_not_pick_c) &&
                 /* not pick  IBL_TARGET_REG if instr is a cti */
                 (!instr_is_cti(instr) || reg != IBL_TARGET_REG))
                 break;
@@ -1768,19 +1810,42 @@ pick_scratch_reg(dcontext_t *dcontext, instr_t *instr, bool dead_reg_ok,
         for (reg = SCRATCH_REG0, slot = TLS_REG0_SLOT; reg <= SCRATCH_REG_LAST;
              reg++, slot += sizeof(reg_t)) {
             if (!instr_reads_from_reg(instr, reg, DR_QUERY_INCLUDE_ALL) &&
+                !reg_overlap(reg, do_not_pick_a) && !reg_overlap(reg, do_not_pick_b) &&
+                !reg_overlap(reg, do_not_pick_c) &&
                 /* Ensure no conflict vs ind br mangling */
                 (!instr_is_cti(instr) || reg != IBL_TARGET_REG))
                 break;
         }
-        if (should_restore != NULL)
+        if (reg <= SCRATCH_REG_LAST && should_restore != NULL)
             *should_restore = false;
     }
-    /* Only OP_stm could read all 4 of our scratch regs and also read or write
+    if (reg > SCRATCH_REG_LAST) {
+        /* As a last resort, use a higher reg with a lower slot.  This may seem
+         * confusing but the translation spill walk code handles it.
+         */
+        for (reg = SCRATCH_REG0, slot = TLS_REG0_SLOT; reg <= SCRATCH_REG_LAST;
+             reg++, slot += sizeof(reg_t)) {
+            if (!reg_overlap(reg, do_not_pick_a) && !reg_overlap(reg, do_not_pick_b) &&
+                !reg_overlap(reg, do_not_pick_c) &&
+                /* not pick  IBL_TARGET_REG if instr is a cti */
+                (!instr_is_cti(instr) || reg != IBL_TARGET_REG))
+                break;
+        }
+        /* We have a slot.  Now pick a reg. */
+        for (reg = SCRATCH_REG_LAST + 1; reg <= DR_REG_STOP_GPR; reg++) {
+            if (!instr_uses_reg(instr, reg) && !reg_overlap(reg, do_not_pick_a) &&
+                !reg_overlap(reg, do_not_pick_b) && !reg_overlap(reg, do_not_pick_c) &&
+                /* not pick  IBL_TARGET_REG if instr is a cti */
+                (!instr_is_cti(instr) || reg != IBL_TARGET_REG))
+                break;
+        }
+    }
+    /* Only OP_stm could read all 6 of our scratch regs and also read or write
      * the PC or stolen reg (OP_smlal{b,t}{b,t} can read 4 GPR's but not a 4th),
      * and it's not allowed to have PC as a base reg (it's "unpredictable" at
      * least).  For stolen reg as base, we should split it up before calling here.
      */
-    if (reg > SCRATCH_REG_LAST)
+    if (reg > DR_REG_STOP_GPR)
         reg = REG_NULL;
     if (scratch_slot != NULL)
         *scratch_slot = slot;
@@ -1852,7 +1917,8 @@ mangle_rel_addr(dcontext_t *dcontext, instrlist_t *ilist, instr_t *instr,
     opnd_t mem_op;
     ushort slot;
     bool should_restore;
-    reg_id_t reg = pick_scratch_reg(dcontext, instr, true, &slot, &should_restore);
+    reg_id_t reg = pick_scratch_reg(dcontext, instr, DR_REG_NULL, DR_REG_NULL,
+                                    DR_REG_NULL, true, &slot, &should_restore);
     opnd_t new_op;
     dr_shift_type_t shift_type;
     uint shift_amt, disp;
@@ -1923,7 +1989,8 @@ mangle_pc_read(dcontext_t *dcontext, instrlist_t *ilist, instr_t *instr,
 {
     ushort slot;
     bool should_restore;
-    reg_id_t reg = pick_scratch_reg(dcontext, instr, true, &slot, &should_restore);
+    reg_id_t reg = pick_scratch_reg(dcontext, instr, DR_REG_NULL, DR_REG_NULL,
+                                    DR_REG_NULL, true, &slot, &should_restore);
     ptr_int_t app_r15 =
         (ptr_int_t)decode_cur_pc(instr_get_raw_bits(instr), instr_get_isa_mode(instr),
                                  instr_get_opcode(instr), instr);
@@ -1958,6 +2025,7 @@ restore_app_value_to_stolen_reg(dcontext_t *dcontext, instrlist_t *ilist, instr_
                                 reg_id_t reg, ushort slot)
 {
     insert_save_to_tls_if_necessary(dcontext, ilist, instr, reg, slot);
+    /* This precise opcode (OP_orr) is checked for in instr_is_stolen_reg_move(). */
     PRE(ilist, instr,
         XINST_CREATE_move(dcontext, opnd_create_reg(reg),
                           opnd_create_reg(dr_reg_stolen)));
@@ -2003,12 +2071,12 @@ restore_tls_base_to_stolen_reg(dcontext_t *dcontext, instrlist_t *ilist, instr_t
         });
     }
     /* restore stolen reg from spill reg */
+    /* This precise opcode (OP_orr) is checked for in instr_is_stolen_reg_move(). */
     PRE(ilist, next_instr,
         XINST_CREATE_move(dcontext, opnd_create_reg(dr_reg_stolen),
                           opnd_create_reg(reg)));
 }
 
-/* XXX: merge with or refactor out old STEAL_REGISTER x86 code? */
 /* Mangle simple dr_reg_stolen access.
  * dr_reg_stolen in gpr_list is handled in mangle_gpr_list_{read/write}.
  *
@@ -2064,7 +2132,8 @@ mangle_stolen_reg(dcontext_t *dcontext, instrlist_t *ilist, instr_t *instr,
 #endif
 
     /* move stolen reg value into tmp reg for app instr execution */
-    tmp = pick_scratch_reg(dcontext, instr, false, &slot, &should_restore);
+    tmp = pick_scratch_reg(dcontext, instr, DR_REG_NULL, DR_REG_NULL, DR_REG_NULL, false,
+                           &slot, &should_restore);
     ASSERT(tmp != REG_NULL);
     restore_app_value_to_stolen_reg(dcontext, ilist, instr, tmp, slot);
 
@@ -2509,7 +2578,8 @@ normalize_ldm_instr(dcontext_t *dcontext, instr_t *instr, /* ldm */
     }
 
     if (instr_uses_reg(instr, dr_reg_stolen) &&
-        pick_scratch_reg(dcontext, instr, false, NULL, NULL) == REG_NULL) {
+        pick_scratch_reg(dcontext, instr, DR_REG_NULL, DR_REG_NULL, DR_REG_NULL, false,
+                         NULL, NULL) == REG_NULL) {
         /* We need split the ldm.
          * We need a scratch reg from r0-r3, so by splitting the bottom reg we're
          * guaranteed to get one.  And since cti uses r2 it works out there.
@@ -2749,6 +2819,7 @@ mangle_cbr_stolen_reg(dcontext_t *dcontext, instrlist_t *ilist, instr_t *instr,
     instr_set_opcode(instr, OP_b);
     instr_set_num_opnds(dcontext, instr, 0, 1);
     instr_set_src(instr, 0, opnd);
+    instr_set_translation(instr, instrlist_get_translation_target(ilist));
 
     PRE(ilist, next_instr, fall);
     PRE(ilist, next_instr, instr_create_restore_from_tls(dcontext, reg, slot));
@@ -2833,8 +2904,8 @@ mangle_icache_op(dcontext_t *dcontext, instrlist_t *ilist, instr_t *instr,
                  instr_t *next_instr, app_pc pc)
 {
     int opc = instr_get_opcode(instr);
-    if (opc == OP_sys) {
-        reg_id_t xt = opnd_get_reg(instr_get_src(instr, 1));
+    if (opc == OP_ic_ivau) {
+        reg_id_t xt = opnd_get_base(instr_get_src(instr, 0));
         /* ic ivau, xT is replaced with: */
         PRE(ilist, instr, /* stp x0, x30, [x28] */
             INSTR_CREATE_stp(
@@ -2853,8 +2924,15 @@ mangle_icache_op(dcontext_t *dcontext, instrlist_t *ilist, instr_t *instr,
                 opnd_create_base_disp(dr_reg_stolen, DR_REG_NULL, 0, 16, OPSZ_16),
                 opnd_create_reg(xt == dr_reg_stolen ? DR_REG_X0 : xt),
                 opnd_create_reg(DR_REG_X30)));
+#    ifdef DR_HOST_NOT_TARGET
+        /* We built all our asm code for the host, but here we need it for the target.
+         * We have to ifdef it out to separate.  Xref i#1684.
+         */
+        ASSERT_NOT_REACHED();
+#    else
         insert_mov_immed_arch(dcontext, NULL, NULL, (ptr_int_t)icache_op_ic_ivau_asm,
                               opnd_create_reg(DR_REG_X30), ilist, instr, NULL, NULL);
+#    endif
         PRE(ilist, instr, /* mov x0, x28 */
             XINST_CREATE_move(dcontext, opnd_create_reg(DR_REG_X0),
                               opnd_create_reg(dr_reg_stolen)));
@@ -2887,8 +2965,15 @@ mangle_icache_op(dcontext_t *dcontext, instrlist_t *ilist, instr_t *instr,
                 dcontext,
                 opnd_create_base_disp(dr_reg_stolen, DR_REG_NULL, 0, 8, OPSZ_16),
                 opnd_create_reg(DR_REG_X1), opnd_create_reg(DR_REG_X2)));
+#    ifdef DR_HOST_NOT_TARGET
+        /* We built all our asm code for the host, but here we need it for the target.
+         * We have to ifdef it out to separate.  Xref i#1684.
+         */
+        ASSERT_NOT_REACHED();
+#    else
         insert_mov_immed_arch(dcontext, NULL, NULL, (ptr_int_t)icache_op_isb_asm,
                               opnd_create_reg(DR_REG_X2), ilist, instr, NULL, NULL);
+#    endif
         insert_mov_immed_arch(dcontext, NULL, NULL, (ptr_int_t)pc,
                               opnd_create_reg(DR_REG_X1), ilist, instr, NULL, NULL);
         PRE(ilist, instr, /* mov x0, x28 */
@@ -2906,7 +2991,833 @@ mangle_icache_op(dcontext_t *dcontext, instrlist_t *ilist, instr_t *instr,
 }
 #endif
 
-/* END OF CONTROL-FLOW MANGLING ROUTINES
+/***************************************************************************
+ * Exclusive load/store mangling.
+ * See the design doc at https://dynamorio.org/page_ldstex.html
+ * for background information.
+ */
+
+static instr_t *
+create_ld_from_ldex(dcontext_t *dcontext, instr_t *ldex)
+{
+    opnd_t regop = instr_get_dst(ldex, 0);
+    opnd_t memop = instr_get_src(ldex, 0);
+    /* TODO i#1698: Preserve ARM predication and add tests. */
+    switch (instr_get_opcode(ldex)) {
+#ifdef AARCH64
+    case OP_ldaxp:
+        /* There is no OP_ldap so we engage the monitor.  Should we add CLREX? */
+        return INSTR_CREATE_ldaxp(dcontext, regop, instr_get_dst(ldex, 1), memop);
+    case OP_ldxp: return INSTR_CREATE_ldp(dcontext, regop, instr_get_dst(ldex, 1), memop);
+    case OP_ldaxr: return INSTR_CREATE_ldar(dcontext, regop, memop);
+    case OP_ldxr: return INSTR_CREATE_ldr(dcontext, regop, memop);
+    case OP_ldaxrb: return INSTR_CREATE_ldarb(dcontext, regop, memop);
+    case OP_ldxrb: return INSTR_CREATE_ldrb(dcontext, regop, memop);
+    case OP_ldaxrh: return INSTR_CREATE_ldarh(dcontext, regop, memop);
+    case OP_ldxrh: return INSTR_CREATE_ldrh(dcontext, regop, memop);
+#else
+    case OP_ldaexd:
+        /* There is no OP_ldad so we engage the monitor.  Should we add CLREX? */
+        return INSTR_CREATE_ldaexd(dcontext, regop, instr_get_dst(ldex, 1), memop);
+    case OP_ldrexd:
+        return INSTR_CREATE_ldrd(dcontext, regop, instr_get_dst(ldex, 1), memop);
+    case OP_ldaex: return INSTR_CREATE_lda(dcontext, regop, memop);
+    case OP_ldrex: return INSTR_CREATE_ldr(dcontext, regop, memop);
+    case OP_ldaexb: return INSTR_CREATE_ldab(dcontext, regop, memop);
+    case OP_ldrexb: return INSTR_CREATE_ldrb(dcontext, regop, memop);
+    case OP_ldaexh: return INSTR_CREATE_ldah(dcontext, regop, memop);
+    case OP_ldrexh: return INSTR_CREATE_ldrh(dcontext, regop, memop);
+#endif
+    default: ASSERT_NOT_REACHED();
+    }
+    return NULL;
+}
+
+static instr_t *
+create_ldax_from_stex(dcontext_t *dcontext, instr_t *strex, reg_id_t *dest_reg INOUT,
+                      /* For a pair, we need a caller-set-up scratch reg for the 2nd. */
+                      reg_id_t dest_reg2,
+                      /* Whether to merge a pair of 4-bytes into one 8-byte. */
+                      bool merge_pair)
+{
+    /* It is challenging to know whether to use an acquire or regular load opcode
+     * because we do not know what the original load opcode was, especially for
+     * situations like dr_prepopulate_cache() where we have no dynamic information
+     * and for cases of two different load opcodes sharing the same store..
+     * Our solution is to always use an acquire load, which won't affect correctness,
+     * on processors where it is supported.
+     */
+#ifdef ARM
+    /* Ideally we'd read ID_ISAR2 but we can't at EL0.  We assume no v7 processor
+     * has acquire support.  We could record whether we've ever seen any acquire
+     * opcodes and flush if we see one.
+     */
+    bool acquire_supported = proc_get_architecture() >= 8;
+#endif
+    opnd_t memop = instr_get_dst(strex, 0);
+    /* We can't assume the stored reg equals the prior loaded-into reg, so we have to
+     * write to a scratch or dead register.  We assume the dest reg is dead (but xref
+     * i#400 noted below on faults): having the value or base register equal it is
+     * disallowed (at least, it's unpredictable behavior: we assume that us
+     * clobbering it falls under possible unpredictable results, though that's
+     * probably not true if we fault the base).
+     * For a pair, we rely on comparing this first value first, as the compare
+     * result writes the same store result register.
+     */
+    opnd_size_t opsz = opnd_get_size(instr_get_src(strex, 0));
+    /* The store dest reg could equal a load dest reg, in which case the caller must
+     * pass us a scratch reg.
+     */
+    if (*dest_reg == DR_REG_NULL)
+        *dest_reg = reg_resize_to_opsz(opnd_get_reg(instr_get_dst(strex, 1)), opsz);
+    else
+        *dest_reg = reg_resize_to_opsz(*dest_reg, opsz);
+    opnd_t regop = opnd_create_reg(*dest_reg);
+    /* TODO i#1698: Preserve ARM predication and add tests. */
+    switch (instr_get_opcode(strex)) {
+#ifdef AARCH64
+    case OP_stlxp:
+    case OP_stxp:
+        /* We treat A64 pair-4byte as single-8byte to handle ldxr;stxp. */
+        if (merge_pair) {
+            ASSERT(opsz == OPSZ_4);
+            *dest_reg = reg_resize_to_opsz(*dest_reg, OPSZ_8);
+            return INSTR_CREATE_ldaxr(dcontext, opnd_create_reg(*dest_reg), memop);
+        } else {
+            return INSTR_CREATE_ldaxp(
+                dcontext, regop, opnd_create_reg(reg_resize_to_opsz(dest_reg2, opsz)),
+                memop);
+        }
+    case OP_stlxr:
+    case OP_stxr: return INSTR_CREATE_ldaxr(dcontext, regop, memop);
+    case OP_stlxrb:
+    case OP_stxrb: return INSTR_CREATE_ldaxrb(dcontext, regop, memop);
+    case OP_stlxrh:
+    case OP_stxrh: return INSTR_CREATE_ldaxrh(dcontext, regop, memop);
+#else
+    case OP_stlexd:
+    case OP_strexd:
+        /* TODO i#1698: ARM register pairs must be <even,even+1> which we are
+         * certainly not guaranteeing today.  This will take some effort to
+         * arrange scratch registers wrt the app's strex usage.  For now we bail
+         * in the caller.
+         */
+        return acquire_supported
+            ? INSTR_CREATE_ldaexd(dcontext, regop,
+                                  opnd_create_reg(reg_resize_to_opsz(dest_reg2, opsz)),
+                                  memop)
+            : INSTR_CREATE_ldrexd(dcontext, regop,
+                                  opnd_create_reg(reg_resize_to_opsz(dest_reg2, opsz)),
+                                  memop);
+    case OP_stlex:
+    case OP_strex:
+        return acquire_supported ? INSTR_CREATE_ldaex(dcontext, regop, memop)
+                                 : INSTR_CREATE_ldrex(dcontext, regop, memop);
+    case OP_stlexb:
+    case OP_strexb:
+        return acquire_supported ? INSTR_CREATE_ldaexb(dcontext, regop, memop)
+                                 : INSTR_CREATE_ldrexb(dcontext, regop, memop);
+    case OP_stlexh:
+    case OP_strexh:
+        return acquire_supported ? INSTR_CREATE_ldaexh(dcontext, regop, memop)
+                                 : INSTR_CREATE_ldrexh(dcontext, regop, memop);
+#endif
+    default: ASSERT_NOT_REACHED();
+    }
+    return NULL;
+}
+
+bool
+instr_is_ldstex_mangling(dcontext_t *dcontext, instr_t *inst)
+{
+    if (!instr_is_our_mangling(inst))
+        return false;
+    /* XXX: Should we update instr_is_DR_reg_spill_or_restore() to handle OP_stp?
+     * But which reg would it return?  We would also need to update for a
+     * swapped stolen reg.  For now doing a custom check.
+     */
+    opnd_t memop = opnd_create_null();
+    if (instr_get_opcode(inst) == OP_str ||
+        instr_get_opcode(inst) == IF_ARM_ELSE(OP_strd, OP_stp))
+        memop = instr_get_dst(inst, 0);
+    else if (instr_get_opcode(inst) == OP_ldr)
+        memop = instr_get_src(inst, 0);
+    if (opnd_is_base_disp(memop) && opnd_get_index(memop) == DR_REG_NULL) {
+        /* We can't check that the base is the stolen reg b/c we may have swapped. */
+        uint offs = opnd_get_disp(memop);
+        if (offs >= TLS_LDSTEX_ADDR_SLOT &&
+            offs <= IF_ARM_ELSE(TLS_LDSTEX_FLAGS_SLOT, TLS_LDSTEX_SIZE_SLOT))
+            return true;
+    }
+    /* Look for loading the stolen reg into a swapped reg, which is unique to
+     * ldstex mangling.
+     */
+    if (instr_is_tls_restore(inst, DR_REG_NULL, TLS_REG_STOLEN_SLOT))
+        return true;
+    ptr_int_t val;
+    if (instr_get_opcode(inst) == OP_sub || instr_get_opcode(inst) == OP_subs ||
+        IF_ARM(instr_get_opcode(inst) == OP_mrs || instr_get_opcode(inst) == OP_msr ||)
+        /* Size should be between 1 (OP_stxrb) and 16 (OP_stxp). */
+        (instr_is_mov_constant(inst, &val) && val >= 1 && val <= 16) ||
+        instr_get_opcode(inst) == OP_cbnz || instr_get_opcode(inst) == OP_b ||
+        instr_get_opcode(inst) == OP_clrex || instr_is_exclusive_load(inst) ||
+        instr_is_exclusive_store(inst))
+        return true;
+    return false;
+}
+
+static bool
+is_cbnz_available(dcontext_t *dcontext, reg_id_t reg_strex_dst)
+{
+#ifdef ARM
+    return dr_get_isa_mode(dcontext) == DR_ISA_ARM_THUMB && reg_strex_dst <= DR_REG_R7;
+#else
+    return true;
+#endif
+}
+
+/* Inserts a jump to label_target if regop1 != regop2, also setting
+ * resop to the result.  Avoids flags usage for is_cbnz_available();
+ * otherwise the caller must have spilled the flags.
+ */
+static void
+insert_compare_and_jump_not_equal(dcontext_t *dcontext, instrlist_t *ilist,
+                                  instr_t *where, opnd_t resop, opnd_t srcop1,
+                                  opnd_t srcop2, instr_t *label_target)
+{
+#ifdef ARM
+    if (!is_cbnz_available(dcontext, opnd_get_reg(resop))) {
+        PRE(ilist, where, INSTR_CREATE_subs(dcontext, resop, srcop1, srcop2));
+        PRE(ilist, where,
+            instr_set_predicate(
+                XINST_CREATE_jump(dcontext, opnd_create_instr(label_target)),
+                DR_PRED_NE));
+        return;
+    }
+#endif
+    PRE(ilist, where, INSTR_CREATE_sub(dcontext, resop, srcop1, srcop2));
+    PRE(ilist, where,
+        INSTR_CREATE_cbnz(dcontext, opnd_create_instr(label_target), resop));
+}
+
+static instr_t *
+mangle_exclusive_load(dcontext_t *dcontext, instrlist_t *ilist, instr_t *instr,
+                      instr_t *next_instr)
+{
+    ASSERT(instr_is_exclusive_load(instr));
+#ifdef ARM
+    /* TODO i#1698: Preserve ARM predication and add tests.  For now we bail. */
+    if (instr_is_predicated(instr)) {
+        SYSLOG_INTERNAL_WARNING_ONCE(
+            "Not converting predicated exclusive load: NYI i#1698");
+        return NULL;
+    }
+    /* TODO i#1698: Pairs on ARM need consecutive registers.  Our scratch + dead reg
+     * usage does not yet support that for our synthetic load.  For now we bail.
+     */
+    bool is_pair = instr_num_dsts(instr) > 1;
+    if (is_pair) {
+        SYSLOG_INTERNAL_WARNING_ONCE(
+            "Not converting exclusive load-pair to compare-and-swap: NYI i#1698");
+        return NULL;
+    }
+#endif
+    LOG(THREAD, LOG_INTERP, 4, "Converting exclusive load @%p to regular\n",
+        get_app_instr_xl8(instr));
+    RSTATS_INC(num_ldex2cas);
+    /* TODO i#1698: Preserve ARM predication and add tests. */
+    /* Analyze for stex_in_same_block *before* replacing the stolen reg, so that
+     * analysis of intervening instrs is looking at the right regs.
+     */
+    reg_id_t value_reg = reg_to_pointer_sized(opnd_get_reg(instr_get_dst(instr, 0)));
+    reg_id_t value2_reg = DR_REG_NULL;
+    if (instr_num_dsts(instr) == 2)
+        value2_reg = reg_to_pointer_sized(opnd_get_reg(instr_get_dst(instr, 1)));
+    ASSERT(opnd_is_base_disp(instr_get_src(instr, 0)) &&
+           opnd_get_index(instr_get_src(instr, 0)) == DR_REG_NULL &&
+           opnd_get_disp(instr_get_src(instr, 0)) == 0);
+    reg_id_t base_reg = opnd_get_base(instr_get_src(instr, 0));
+    /* No need to save the attributes of the ldex if its paired stex is in the same
+     * block with no changes to the address or value in between (and we can check
+     * the size statically).
+     */
+    bool stex_in_same_block = false;
+    for (instr_t *in = instr_get_next(instr); in != NULL; in = instr_get_next(in)) {
+        /* Bail on optimized mangling if followed by another load or a clear of the
+         * monitor before the store, since both invalidate this load's monitor.
+         */
+        if (instr_is_app(in) &&
+            (instr_is_exclusive_load(in) || instr_get_opcode(in) == OP_clrex))
+            break;
+        if (instr_is_app(in) && instr_is_exclusive_store(in)) {
+            /* Warn on a mismatched pair. */
+            if (opnd_get_size(instr_get_dst(in, 0)) !=
+                opnd_get_size(instr_get_src(instr, 0))) {
+                /* See comment below about CONSTRAINED UNPREDICTABLE. */
+                SYSLOG_INTERNAL_WARNING_ONCE(
+                    "Encountered mismatched-size ldex-stex pair: behavior may not "
+                    "exactly match CONSTRAINED UNPREDICTABLE hardware");
+            }
+            if (opnd_get_size(instr_get_dst(in, 0)) ==
+                    opnd_get_size(instr_get_src(instr, 0)) &&
+                /* Bail on one side being a pair of 4-byte and the other a single 8-byte:
+                 * too complicated for the optimized form.
+                 */
+                opnd_get_size(instr_get_src(in, 0)) ==
+                    opnd_get_size(instr_get_dst(instr, 0)) &&
+                opnd_get_base(instr_get_dst(in, 0)) == base_reg &&
+                /* pick_scratch_reg() only takes 3 conflicts, so we push a pair with the
+                 * store res matching a load dest and using the stolen reg to the
+                 * unoptimized sequence.  We keep non-stolen-reg cases on the optimized
+                 * path because this is relatively common: a store-release pair uses a
+                 * monitor because there is no store-release-pair opcode; its load
+                 * destinations are discarded, but both cannot be XZR since that is
+                 * undefined behavior: so the dead register store result is used.
+                 */
+                (!instr_uses_reg(in, dr_reg_stolen) ||
+                 (reg_to_pointer_sized(opnd_get_reg(instr_get_dst(in, 1))) != value_reg &&
+                  reg_to_pointer_sized(opnd_get_reg(instr_get_dst(in, 1))) !=
+                      value2_reg)) &&
+                /* We bail on optimizing A32 where we have no OP_cbnz and we'd need
+                 * to complicate the optimized sequence with a flags spill.
+                 */
+                is_cbnz_available(dcontext, opnd_get_reg(instr_get_dst(in, 1)))) {
+                /* Base and size are the same. */
+                stex_in_same_block = true;
+                LOG(THREAD, LOG_INTERP, 4,
+                    "Using optimized same-block ldex-stex mangling\n");
+            }
+            break;
+        }
+        /* Look for changes from app or tool instrs. */
+        if (instr_writes_to_reg(in, value_reg, DR_QUERY_INCLUDE_ALL) ||
+            (value2_reg != DR_REG_NULL &&
+             instr_writes_to_reg(in, value2_reg, DR_QUERY_INCLUDE_ALL)) ||
+            instr_writes_to_reg(in, base_reg, DR_QUERY_INCLUDE_ALL)) {
+            LOG(THREAD, LOG_INTERP, 4,
+                "Value clobbered => not using same-block ldex-stex mangling\n");
+            break;
+        }
+    }
+    /* If the ldex uses the stolen reg, we do not swap around it as we normally do,
+     * since we have a bunch of TLS refs inside that would then have a non-standard
+     * base and confuse translation code.  Instead we change the ldex.
+     */
+    reg_id_t stolen_swap_reg = DR_REG_NULL;
+    ushort swap_slot = 0;
+    bool swap_restore = false;
+    if (instr_uses_reg(instr, dr_reg_stolen)) {
+        if (value_reg == dr_reg_stolen || value2_reg == dr_reg_stolen) {
+            /* We can handle the base being the stolen reg: but the values we
+             * need to read from these same regs for checks in strex mangling
+             * and it gets complex if we have to get yet another scratch reg to
+             * get the app value.  It is simpler to bail on the opt in this case.
+             */
+            stex_in_same_block = false;
+        }
+        stolen_swap_reg = pick_scratch_reg(dcontext, instr, DR_REG_NULL, DR_REG_NULL,
+                                           DR_REG_NULL, false, &swap_slot, &swap_restore);
+        if (swap_restore) {
+            insert_save_to_tls_if_necessary(dcontext, ilist, instr, stolen_swap_reg,
+                                            swap_slot);
+        }
+        if (instr_reads_from_reg(instr, dr_reg_stolen, DR_QUERY_DEFAULT)) {
+            PRE(ilist, instr,
+                instr_create_restore_from_tls(dcontext, stolen_swap_reg,
+                                              TLS_REG_STOLEN_SLOT));
+        }
+        instr_replace_reg_resize(instr, dr_reg_stolen, stolen_swap_reg);
+        /* Re-acquire registers we may have replaced. */
+        value_reg = reg_to_pointer_sized(opnd_get_reg(instr_get_dst(instr, 0)));
+        if (instr_num_dsts(instr) == 2)
+            value2_reg = reg_to_pointer_sized(opnd_get_reg(instr_get_dst(instr, 1)));
+        base_reg = opnd_get_base(instr_get_src(instr, 0));
+    }
+    ushort xzr_slot = 0, xzr2_slot = 0;
+    bool xzr_restore = false, xzr2_restore = false;
+    reg_id_t xzr_repl = DR_REG_NULL, xzr2_repl = DR_REG_NULL;
+#ifdef AARCH64
+    /* If the ldex loads into the zero register, we need to instead get the real
+     * value so our compare at the stex will succeed (otherwise we will loop
+     * forever: i#5245).  For same-block we statically skip the compare.
+     */
+    if (!stex_in_same_block && value_reg == DR_REG_XZR) {
+        xzr_repl = pick_scratch_reg(dcontext, instr, stolen_swap_reg, DR_REG_NULL,
+                                    DR_REG_NULL, true, &xzr_slot, &xzr_restore);
+        if (xzr_restore)
+            insert_save_to_tls_if_necessary(dcontext, ilist, instr, xzr_repl, xzr_slot);
+        opnd_t value_op = instr_get_dst(instr, 0);
+        opnd_replace_reg_resize(&value_op, opnd_get_reg(value_op), xzr_repl);
+        instr_set_dst(instr, 0, value_op);
+        value_reg = xzr_repl;
+    }
+    if (!stex_in_same_block && value2_reg == DR_REG_XZR) {
+        if (value_reg == DR_REG_XZR) {
+            /* LDAXP with dest1==dest2 has undefined behavior, but we try to handle it.
+             * XXX: I tried to test this but it raises SIGILL on my hardware.
+             */
+            ASSERT_NOT_TESTED();
+        }
+        xzr2_repl = pick_scratch_reg(dcontext, instr, stolen_swap_reg, xzr_repl,
+                                     DR_REG_NULL, true, &xzr2_slot, &xzr2_restore);
+        if (xzr2_restore)
+            insert_save_to_tls_if_necessary(dcontext, ilist, instr, xzr2_repl, xzr2_slot);
+        opnd_t value2_op = instr_get_dst(instr, 1);
+        opnd_replace_reg_resize(&value2_op, opnd_get_reg(value2_op), xzr2_repl);
+        instr_set_dst(instr, 1, value2_op);
+        value2_reg = xzr2_repl;
+    }
+#endif
+    instr_t *where = instr_get_next(instr);
+    if (stex_in_same_block) {
+        /* Insert a label so subsequent stex mangling knows the ldex was here. */
+        instr_t *marker = INSTR_CREATE_label(dcontext);
+        instr_set_note(marker, (void *)DR_NOTE_LDEX);
+        dr_instr_label_data_t *label_data = instr_get_label_data_area(marker);
+        label_data->data[0] = value_reg;  /* Ruled out dr_reg_stolen above. */
+        label_data->data[1] = value2_reg; /* Ruled out dr_reg_stolen above. */
+        PRE(ilist, where, marker);
+    } else {
+        /* Save info on the load for comparison when (if) we hit the store.
+         * We insert this *after* the load so we'll have the value loaded.
+         */
+        /* We need a scratch register. */
+        ushort slot;
+        bool should_restore;
+        reg_id_t scratch = pick_scratch_reg(dcontext, instr, stolen_swap_reg, xzr_repl,
+                                            xzr2_repl, true, &slot, &should_restore);
+        if (should_restore)
+            insert_save_to_tls_if_necessary(dcontext, ilist, where, scratch, slot);
+        /* Write the address and value to TLS. */
+        /* Pair store requires consecutive register numbers for 32-bit. */
+        bool use_pair = IF_AARCH64_ELSE(base_reg != DR_REG_SP, false);
+        if (use_pair) {
+            PRE(ilist, where,
+                XINST_CREATE_store_pair(
+                    dcontext,
+                    opnd_create_base_disp(dr_reg_stolen, DR_REG_NULL, 0,
+                                          TLS_LDSTEX_ADDR_SLOT,
+                                          IF_ARM_ELSE(OPSZ_8, OPSZ_16)),
+                    opnd_create_reg(base_reg), opnd_create_reg(value_reg)));
+        } else {
+            /* A64 won't let you use sp as a GPR.  Grrr. */
+            if (IF_AARCH64_ELSE(base_reg == DR_REG_SP, false)) {
+                PRE(ilist, where,
+                    XINST_CREATE_move(dcontext, opnd_create_reg(scratch),
+                                      opnd_create_reg(base_reg)));
+                PRE(ilist, where,
+                    instr_create_save_to_tls(dcontext, scratch, TLS_LDSTEX_ADDR_SLOT));
+            } else {
+                PRE(ilist, where,
+                    instr_create_save_to_tls(dcontext, base_reg, TLS_LDSTEX_ADDR_SLOT));
+            }
+            PRE(ilist, where,
+                instr_create_save_to_tls(dcontext, value_reg, TLS_LDSTEX_VALUE_SLOT));
+        }
+        /* Write the size to TLS, using a scratch register. */
+        PRE(ilist, where,
+            XINST_CREATE_load_int(
+                dcontext, opnd_create_reg(scratch),
+                OPND_CREATE_INT(opnd_get_size(instr_get_src(instr, 0)))));
+        /* If a load-pair, write the 2nd value as well. */
+        if (instr_num_dsts(instr) == 2) {
+            /* For 32-bit, pair store requires consecutive register numbers.
+             * XXX: We could store the 2 values at once.
+             */
+            if (IF_AARCH64_ELSE(opnd_get_size(instr_get_dst(instr, 0)) == OPSZ_PTR,
+                                false)) {
+                PRE(ilist, where,
+                    XINST_CREATE_store_pair(
+                        dcontext,
+                        opnd_create_base_disp(dr_reg_stolen, DR_REG_NULL, 0,
+                                              TLS_LDSTEX_VALUE2_SLOT,
+                                              IF_ARM_ELSE(OPSZ_8, OPSZ_16)),
+                        opnd_create_reg(value2_reg), opnd_create_reg(scratch)));
+            } else {
+                /* For A64, we have to treat a pair of 4-bytes as one 8-byte b/c the
+                 * strex could be a singleton.
+                 */
+                if (IF_AARCH64_ELSE(opnd_get_size(instr_get_dst(instr, 0)) == OPSZ_4,
+                                    false)) {
+                    PRE(ilist, where,
+                        XINST_CREATE_store(
+                            dcontext,
+                            opnd_create_base_disp(dr_reg_stolen, DR_REG_NULL, 0,
+                                                  TLS_LDSTEX_VALUE_SLOT + 4, OPSZ_4),
+                            instr_get_dst(instr, 1)));
+                } else {
+                    PRE(ilist, where,
+                        instr_create_save_to_tls(dcontext, value2_reg,
+                                                 TLS_LDSTEX_VALUE_SLOT));
+                }
+                PRE(ilist, where,
+                    instr_create_save_to_tls(dcontext, scratch, TLS_LDSTEX_SIZE_SLOT));
+            }
+        } else {
+            PRE(ilist, where,
+                instr_create_save_to_tls(dcontext, scratch, TLS_LDSTEX_SIZE_SLOT));
+        }
+        if (should_restore) {
+            PRE(ilist, where, instr_create_restore_from_tls(dcontext, scratch, slot));
+        }
+    }
+    /* Replace the exclusive load with a non-exclusive version. */
+    instr_t *ld_nonex = create_ld_from_ldex(dcontext, instr);
+    instrlist_preinsert(ilist, instr, ld_nonex);
+    if (stolen_swap_reg != DR_REG_NULL) {
+        if (instr_writes_to_reg(instr, stolen_swap_reg, DR_QUERY_INCLUDE_COND_DSTS)) {
+            PRE(ilist, where,
+                instr_create_save_to_tls(dcontext, stolen_swap_reg, TLS_REG_STOLEN_SLOT));
+        }
+        if (swap_restore) {
+            PRE(ilist, where,
+                instr_create_restore_from_tls(dcontext, stolen_swap_reg, swap_slot));
+        }
+    }
+    if (xzr_restore)
+        PRE(ilist, where, instr_create_restore_from_tls(dcontext, xzr_repl, xzr_slot));
+    if (xzr2_restore)
+        PRE(ilist, where, instr_create_restore_from_tls(dcontext, xzr2_repl, xzr2_slot));
+    instrlist_remove(ilist, instr);
+    instr_destroy(dcontext, instr);
+    return next_instr;
+}
+
+static instr_t *
+mangle_exclusive_store(dcontext_t *dcontext, instrlist_t *ilist, instr_t *instr,
+                       instr_t *next_instr)
+{
+    ASSERT(instr_is_exclusive_store(instr));
+    bool is_pair = instr_num_srcs(instr) > 1;
+#ifdef ARM
+    /* TODO i#1698: Preserve ARM predication and add tests.  For now we bail. */
+    if (instr_is_predicated(instr)) {
+        SYSLOG_INTERNAL_WARNING_ONCE(
+            "Not converting predicated exclusive store to compare-and-swap: NYI i#1698");
+        return NULL;
+    }
+    /* TODO i#1698: Pairs on ARM need consecutive registers.  Our scratch + dead reg
+     * usage does not yet support that for our synthetic load.  For now we bail.
+     */
+    if (is_pair) {
+        SYSLOG_INTERNAL_WARNING_ONCE(
+            "Not converting exclusive store-pair to compare-and-swap: NYI i#1698");
+        return NULL;
+    }
+#endif
+    LOG(THREAD, LOG_INTERP, 4, "Converting exclusive store @%p to compare-and-swap\n",
+        get_app_instr_xl8(instr));
+    RSTATS_INC(num_stex2cas);
+    reg_id_t reg_orig_ld_val = DR_REG_NULL;
+    reg_id_t reg_orig_ld_val2 = DR_REG_NULL;
+    /* Check whether there's a paired prior ldex with nice behavior (no clear in
+     * between, no write to the base or value regs, etc.: all checked in
+     * mangle_exclusive_load()), indicated by a label.
+     */
+    bool ldex_in_same_block = false;
+    for (instr_t *in = instr_get_prev(instr); in != NULL; in = instr_get_prev(in)) {
+        /* The label is always after the matching load. */
+        if (instr_is_exclusive_load(in) || instr_is_exclusive_store(in))
+            break;
+        if (instr_is_label(in) && instr_get_note(in) == (void *)DR_NOTE_LDEX) {
+            ldex_in_same_block = true;
+            dr_instr_label_data_t *label_data = instr_get_label_data_area(in);
+            reg_orig_ld_val = (reg_id_t)label_data->data[0];
+            reg_orig_ld_val2 = (reg_id_t)label_data->data[1];
+            break;
+        }
+    }
+    reg_id_t stolen_swap_reg = DR_REG_NULL;
+    ushort swap_slot = 0;
+    bool swap_restore = false;
+    /* If the stex uses the stolen reg, we do not swap around it as we normally do,
+     * since we have a bunch of TLS refs inside that would then have a non-standard
+     * base and confuse translation code.  Instead we change the stex.
+     */
+    if (instr_uses_reg(instr, dr_reg_stolen)) {
+        /* Make sure we don't clobber a prior value reg, if any.
+         * Below we make sure our scratch reg is distinct from this swap reg,
+         * which fortunately is a separate case from having prior value regs.
+         */
+        stolen_swap_reg =
+            pick_scratch_reg(dcontext, instr, reg_orig_ld_val, reg_orig_ld_val2,
+                             DR_REG_NULL, false, &swap_slot, &swap_restore);
+        if (swap_restore) {
+            insert_save_to_tls_if_necessary(dcontext, ilist, instr, stolen_swap_reg,
+                                            swap_slot);
+        }
+        if (instr_reads_from_reg(instr, dr_reg_stolen, DR_QUERY_DEFAULT)) {
+            PRE(ilist, instr,
+                instr_create_restore_from_tls(dcontext, stolen_swap_reg,
+                                              TLS_REG_STOLEN_SLOT));
+        }
+        instr_replace_reg_resize(instr, dr_reg_stolen, stolen_swap_reg);
+    }
+
+    reg_id_t reg_res = opnd_get_reg(instr_get_dst(instr, 1));
+    opnd_t op_res = opnd_create_reg(reg_to_pointer_sized(reg_res));
+    ASSERT(opnd_is_base_disp(instr_get_dst(instr, 0)) &&
+           opnd_get_index(instr_get_dst(instr, 0)) == DR_REG_NULL &&
+           opnd_get_disp(instr_get_dst(instr, 0)) == 0);
+    /* We treat non-same-block A64 pair-4byte as single-8byte to handle ldxr;stxp. */
+    if (is_pair && !ldex_in_same_block &&
+        opnd_get_size(instr_get_src(instr, 1)) == OPSZ_4)
+        is_pair = false;
+    reg_t reg_base = opnd_get_base(instr_get_dst(instr, 0));
+    instr_t *no_match = INSTR_CREATE_label(dcontext);
+
+    /* The store could use 4 different regs (stxp), and we need 2 scratch regs to
+     * hold a pair of prior values, plus another for one of the new values (the other
+     * we put in the dead status reg): so 7 regs, but only 3 slots.  The stolen reg
+     * swap does not add because the store would then use one fewer of the scratch
+     * reg range.
+     * For our scratch registers used for comparisons, we cannot easily use a dead
+     * register because the compares have to write to the store result (so the mismatch
+     * case has the right result), and that would clobber a subsequent compare's
+     * sources: thus we pass false for dead_reg_ok.  (We do use the dead store result
+     * for the first live-value in create_ldax_from_stex() which works out as we
+     * compare that one immediately.)
+     */
+    reg_id_t scratch = DR_REG_NULL, scratch2 = DR_REG_NULL, scratch3 = DR_REG_NULL;
+    ushort slot, slot2, slot3;
+    bool should_restore = false, should_restore2 = false, should_restore3 = false;
+    reg_id_t reg_new_ld_val = DR_REG_NULL;
+    reg_id_t reg_new_ld_val2 = DR_REG_NULL;
+    bool compare_second_first = false;
+    if (ldex_in_same_block) {
+        /* We aren't saving the flags so we can only handle Thumb mode with CBNZ. */
+        IF_ARM(ASSERT(is_cbnz_available(dcontext, reg_res)));
+        if (reg_to_pointer_sized(reg_res) == reg_orig_ld_val ||
+            reg_to_pointer_sized(reg_res) == reg_orig_ld_val2) {
+            /* We can't use the store res in the synthetic load if it has a value. */
+            scratch = pick_scratch_reg(dcontext, instr, stolen_swap_reg, reg_orig_ld_val,
+                                       reg_orig_ld_val2,
+                                       /*dead_reg_ok=*/false, &slot, &should_restore);
+            if (should_restore)
+                insert_save_to_tls_if_necessary(dcontext, ilist, instr, scratch, slot);
+            reg_new_ld_val = scratch;
+            if (reg_to_pointer_sized(reg_res) == reg_orig_ld_val2)
+                compare_second_first = true;
+        }
+        if (is_pair) {
+            /* We do need one scratch reg for the value comparison. */
+            /* pick_scratch_reg() only takes 3 conflicts, so we push a pair with the
+             * store res matching a load dest (scratch != DR_REG_NULL) and using the
+             * stolen register (stolen_swap_reg != DR_REG_NULL) to not use
+             * ldex_in_same_block.
+             */
+            ASSERT(stolen_swap_reg == DR_REG_NULL || scratch == DR_REG_NULL);
+            reg_id_t swap_or_scratch =
+                (stolen_swap_reg == DR_REG_NULL) ? scratch : stolen_swap_reg;
+            scratch3 = pick_scratch_reg(dcontext, instr, swap_or_scratch, reg_orig_ld_val,
+                                        reg_orig_ld_val2,
+                                        /*dead_reg_ok=*/false, &slot3, &should_restore3);
+            if (should_restore3)
+                insert_save_to_tls_if_necessary(dcontext, ilist, instr, scratch3, slot3);
+            reg_new_ld_val2 = scratch3;
+        }
+    } else {
+        ASSERT(reg_orig_ld_val == DR_REG_NULL &&
+               reg_orig_ld_val2 ==
+                   DR_REG_NULL); /* We only have to avoid stolen_swap_reg. */
+        /* We pass false to avoid the status reg, which we ourselves use. */
+        scratch = pick_scratch_reg(dcontext, instr, stolen_swap_reg, DR_REG_NULL,
+                                   DR_REG_NULL, false, &slot, &should_restore);
+        if (should_restore)
+            insert_save_to_tls_if_necessary(dcontext, ilist, instr, scratch, slot);
+#ifdef ARM
+        if (!is_cbnz_available(dcontext, reg_res)) {
+            /* We have no CBNZ so we need to preserve the flags. */
+            dr_save_arith_flags_to_reg(dcontext, ilist, instr, scratch);
+            PRE(ilist, instr,
+                instr_create_save_to_tls(dcontext, scratch, TLS_LDSTEX_FLAGS_SLOT));
+        }
+#endif
+        if (is_pair) {
+            scratch2 =
+                pick_scratch_reg(dcontext, instr, stolen_swap_reg, scratch, DR_REG_NULL,
+                                 /*dead_reg_ok=*/false, &slot2, &should_restore2);
+            scratch3 =
+                pick_scratch_reg(dcontext, instr, stolen_swap_reg, scratch, scratch2,
+                                 /*dead_reg_ok=*/false, &slot3, &should_restore3);
+            if (should_restore2)
+                insert_save_to_tls_if_necessary(dcontext, ilist, instr, scratch2, slot2);
+            if (should_restore3)
+                insert_save_to_tls_if_necessary(dcontext, ilist, instr, scratch3, slot3);
+            reg_new_ld_val2 = scratch3;
+        }
+        /* Compare address, arranging op_res to show failure on mismatch (though
+         * now that we have a stex after no_match for fault fidelity it will set
+         * op_res for us; we need a dead/scratch here anyway and op_res fits the bill).
+         * XXX i#400: It is possible that the store could fault and the app could
+         * examine op_res in the handler: i.e., it's not truly dead.  We do not
+         * account for that here.
+         */
+        PRE(ilist, instr,
+            instr_create_restore_from_tls(dcontext, scratch, TLS_LDSTEX_ADDR_SLOT));
+        insert_compare_and_jump_not_equal(dcontext, ilist, instr, op_res,
+                                          opnd_create_reg(reg_base),
+                                          opnd_create_reg(scratch), no_match);
+
+        /* Compare size, arranging op_res to show failure on mismatch.  On some
+         * processors, if the stxr's address range is a subset of the ldxp's range, it
+         * will succeed, even if the size or base address are not identical.  However,
+         * the manual states that this is CONSTRAINED UNPREDICTABLE behavior: B2.9.5 says
+         * "software can rely on a LoadExcl / StoreExcl pair to eventually succeed only
+         * if the LoadExcl and the StoreExcl have the same transaction size."  Similarly
+         * for the target VA and reg count.  Thus, given the complexity of trying to
+         * match the actual processor behavior and comparing ranges and whatnot, we're ok
+         * with DR enforcing a strict equality, until or unless we see real apps relying
+         * on processor quirks.
+         */
+        PRE(ilist, instr,
+            instr_create_restore_from_tls(dcontext, scratch, TLS_LDSTEX_SIZE_SLOT));
+        insert_compare_and_jump_not_equal(
+            dcontext, ilist, instr, op_res, opnd_create_reg(scratch),
+            OPND_CREATE_INT(opnd_get_size(instr_get_dst(instr, 0))), no_match);
+    }
+
+    /* Perform the compare-and-swap. */
+    if (!ldex_in_same_block) {
+        PRE(ilist, instr,
+            instr_create_restore_from_tls(dcontext, scratch, TLS_LDSTEX_VALUE_SLOT));
+        reg_orig_ld_val = scratch;
+        if (is_pair) {
+            PRE(ilist, instr,
+                instr_create_restore_from_tls(dcontext, scratch2,
+                                              TLS_LDSTEX_VALUE2_SLOT));
+            reg_orig_ld_val2 = scratch2;
+        }
+    }
+    PRE(ilist, instr,
+        create_ldax_from_stex(dcontext, instr, &reg_new_ld_val, reg_new_ld_val2,
+                              !is_pair));
+    reg_new_ld_val = reg_to_pointer_sized(reg_new_ld_val);
+    /* Skip the value comparison if the load discarded via XZR.
+     * This is not an optimization, but required to avoid an infinite loop (i#5245).
+     * (For !ldex_in_same_block, we handle this when mangling the load.)
+     */
+    if (is_pair &&
+        /* If the 2nd matches the store results, we have to compare it first, since
+         * op_res will clobber the value.
+         */
+        compare_second_first IF_AARCH64(
+            &&(!ldex_in_same_block || reg_orig_ld_val2 != DR_REG_XZR))) {
+        insert_compare_and_jump_not_equal(dcontext, ilist, instr, op_res,
+                                          opnd_create_reg(reg_new_ld_val2),
+                                          opnd_create_reg(reg_orig_ld_val2), no_match);
+    }
+    if (IF_AARCH64_ELSE(!ldex_in_same_block || reg_orig_ld_val != DR_REG_XZR, true)) {
+        insert_compare_and_jump_not_equal(dcontext, ilist, instr, op_res,
+                                          opnd_create_reg(reg_new_ld_val),
+                                          opnd_create_reg(reg_orig_ld_val), no_match);
+    }
+    if (is_pair &&
+        !compare_second_first IF_AARCH64(
+            &&(!ldex_in_same_block || reg_orig_ld_val2 != DR_REG_XZR))) {
+        insert_compare_and_jump_not_equal(dcontext, ilist, instr, op_res,
+                                          opnd_create_reg(reg_new_ld_val2),
+                                          opnd_create_reg(reg_orig_ld_val2), no_match);
+    }
+
+    /* <---- The original store is here. ----> */
+
+    instr_t *post_store = instr_get_next(instr);
+    instr_t *skip_clrex = INSTR_CREATE_label(dcontext);
+    PRE(ilist, post_store, XINST_CREATE_jump(dcontext, opnd_create_instr(skip_clrex)));
+    PRE(ilist, post_store, no_match);
+    /* Clear the monitor, which would happen on a real mismatch. */
+    PRE(ilist, post_store, INSTR_CREATE_clrex(dcontext));
+    /* Execute the store to duplicate a fault, which happens natively on a mismatch.
+     * If we don't do this, the app will likely loop back and might loop forever or
+     * might fault incorrectly on the load if its base is now bad.
+     */
+    PRE(ilist, post_store, instr_clone(dcontext, instr));
+    PRE(ilist, post_store, skip_clrex);
+    if (should_restore) {
+#ifdef ARM
+        if (!is_cbnz_available(dcontext, reg_res)) {
+            PRE(ilist, post_store,
+                instr_create_restore_from_tls(dcontext, scratch, TLS_LDSTEX_FLAGS_SLOT));
+            dr_restore_arith_flags_from_reg(dcontext, ilist, post_store, scratch);
+        }
+#endif
+        PRE(ilist, post_store, instr_create_restore_from_tls(dcontext, scratch, slot));
+    }
+    if (should_restore2) {
+        PRE(ilist, post_store, instr_create_restore_from_tls(dcontext, scratch2, slot2));
+    }
+    if (should_restore3) {
+        PRE(ilist, post_store, instr_create_restore_from_tls(dcontext, scratch3, slot3));
+    }
+    if (stolen_swap_reg != DR_REG_NULL) {
+        if (instr_writes_to_reg(instr, stolen_swap_reg, DR_QUERY_INCLUDE_COND_DSTS)) {
+            PRE(ilist, post_store,
+                instr_create_save_to_tls(dcontext, stolen_swap_reg, TLS_REG_STOLEN_SLOT));
+        }
+        if (swap_restore) {
+            PRE(ilist, post_store,
+                instr_create_restore_from_tls(dcontext, stolen_swap_reg, swap_slot));
+        }
+    }
+    return next_instr;
+}
+
+/* Returns NULL if it did not instrument and the caller should handle stolen reg, etc. */
+instr_t *
+mangle_exclusive_monitor_op(dcontext_t *dcontext, instrlist_t *ilist, instr_t *instr,
+                            instr_t *next_instr)
+{
+    if (!INTERNAL_OPTION(ldstex2cas))
+        return NULL;
+    /* For -ldstex2cas we convert exclusive monitor regions into compare-and-swap
+     * operations in order to allow regular instrumentation, with the downside of
+     * weaker synchronization semantics.
+     * See https://dynamorio.org/page_ldstex.html for background and further details.
+     * The summary is:
+     * + On an exclusive load, save the address, value, opcode, and size,
+     *   and convert to a non-exclusive load.
+     * + On an exclusive store, if the address, value, or size do not match,
+     *   fail the store.  If the opcode does not match: we have complications;
+     *   exit to DR.
+     *   Then insert a compare-and-swap.
+     * + On OP_clrex, clear the saved address.
+     */
+    if (instr_is_exclusive_load(instr)) {
+        return mangle_exclusive_load(dcontext, ilist, instr, next_instr);
+    } else if (instr_is_exclusive_store(instr)) {
+        return mangle_exclusive_store(dcontext, ilist, instr, next_instr);
+    } else if (instr_get_opcode(instr) == OP_clrex) {
+        LOG(THREAD, LOG_INTERP, 4, "Clearing fields for CLREX @%p\n",
+            get_app_instr_xl8(instr));
+        /* Clear the ldstex fields.  Just the addr field should do it.
+         * We just need to ensure that "ldxr;clrex;stxr" fails.
+         * We rule out same-block handling (which skips the addr comparison)
+         * above in ldex handling.
+         */
+#ifdef AARCH64
+        PRE(ilist, instr,
+            instr_create_save_to_tls(dcontext, DR_REG_XZR, TLS_LDSTEX_ADDR_SLOT));
+#else
+        ushort slot;
+        bool should_restore;
+        reg_id_t scratch = pick_scratch_reg(dcontext, instr, DR_REG_NULL, DR_REG_NULL,
+                                            DR_REG_NULL, true, &slot, &should_restore);
+        if (should_restore)
+            insert_save_to_tls_if_necessary(dcontext, ilist, instr, scratch, slot);
+        PRE(ilist, instr,
+            XINST_CREATE_load_int(dcontext, opnd_create_reg(scratch),
+                                  OPND_CREATE_INT(0)));
+        PRE(ilist, instr,
+            instr_create_save_to_tls(dcontext, scratch, TLS_LDSTEX_ADDR_SLOT));
+        if (should_restore)
+            PRE(ilist, instr, instr_create_restore_from_tls(dcontext, scratch, slot));
+#endif
+    }
+    return next_instr;
+}
+
+/* END OF MANGLING ROUTINES
  *###########################################################################
  *###########################################################################
  */

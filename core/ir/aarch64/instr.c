@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2017 Google, Inc.  All rights reserved.
+ * Copyright (c) 2017-2022 Google, Inc.  All rights reserved.
  * Copyright (c) 2016 ARM Limited. All rights reserved.
  * **********************************************************/
 
@@ -80,9 +80,19 @@ instr_branch_type(instr_t *cti_instr)
     case OP_tbnz:
     case OP_tbz: return LINK_DIRECT | LINK_JMP;
     case OP_bl: return LINK_DIRECT | LINK_CALL;
+    case OP_blraa:
+    case OP_blrab:
+    case OP_blraaz:
+    case OP_blrabz:
     case OP_blr: return LINK_INDIRECT | LINK_CALL;
-    case OP_br: return LINK_INDIRECT | LINK_JMP;
-    case OP_ret: return LINK_INDIRECT | LINK_RETURN;
+    case OP_br:
+    case OP_braa:
+    case OP_brab:
+    case OP_braaz:
+    case OP_brabz: return LINK_INDIRECT | LINK_JMP;
+    case OP_ret:
+    case OP_retaa:
+    case OP_retab: return LINK_INDIRECT | LINK_RETURN;
     }
     CLIENT_ASSERT(false, "instr_branch_type: unknown opcode");
     return LINK_INDIRECT;
@@ -105,7 +115,15 @@ bool
 instr_is_call_arch(instr_t *instr)
 {
     int opc = instr->opcode; /* caller ensures opcode is valid */
-    return (opc == OP_bl || opc == OP_blr);
+    switch (opc) {
+    case OP_bl:
+    case OP_blr:
+    case OP_blraa:
+    case OP_blrab:
+    case OP_blraaz:
+    case OP_blrabz: return true;
+    default: return false;
+    }
 }
 
 bool
@@ -126,14 +144,21 @@ bool
 instr_is_call_indirect(instr_t *instr)
 {
     int opc = instr_get_opcode(instr);
-    return (opc == OP_blr);
+    switch (opc) {
+    case OP_blr:
+    case OP_blraa:
+    case OP_blrab:
+    case OP_blraaz:
+    case OP_blrabz: return true;
+    default: return false;
+    }
 }
 
 bool
 instr_is_return(instr_t *instr)
 {
     int opc = instr_get_opcode(instr);
-    return (opc == OP_ret);
+    return (opc == OP_ret || opc == OP_retaa || opc == OP_retab);
 }
 
 bool
@@ -149,7 +174,22 @@ bool
 instr_is_mbr_arch(instr_t *instr)
 {
     int opc = instr->opcode; /* caller ensures opcode is valid */
-    return (opc == OP_blr || opc == OP_br || opc == OP_ret);
+    switch (opc) {
+    case OP_blr:
+    case OP_br:
+    case OP_braa:
+    case OP_brab:
+    case OP_braaz:
+    case OP_brabz:
+    case OP_blraa:
+    case OP_blrab:
+    case OP_blraaz:
+    case OP_blrabz:
+    case OP_ret:
+    case OP_retaa:
+    case OP_retab: return true;
+    default: return false;
+    }
 }
 
 bool
@@ -246,8 +286,15 @@ instr_is_mov_constant(instr_t *instr, ptr_int_t *value)
 bool
 instr_is_prefetch(instr_t *instr)
 {
-    /* FIXME i#1569: NYI */
-    return false;
+    switch (instr_get_opcode(instr)) {
+    case OP_prfm:
+    case OP_prfum:
+    case OP_prfb:
+    case OP_prfh:
+    case OP_prfw:
+    case OP_prfd: return true;
+    default: return false;
+    }
 }
 
 bool
@@ -275,8 +322,7 @@ bool
 instr_is_icache_op(instr_t *instr)
 {
     int opc = instr_get_opcode(instr);
-#define SYS_ARG_IC_IVAU 0x1ba9
-    if (opc == OP_sys && opnd_get_immed_int(instr_get_src(instr, 0)) == SYS_ARG_IC_IVAU)
+    if (opc == OP_ic_ivau)
         return true; /* ic ivau, xT */
     if (opc == OP_isb)
         return true; /* isb */
@@ -300,7 +346,20 @@ instr_is_undefined(instr_t *instr)
 void
 instr_invert_cbr(instr_t *instr)
 {
-    ASSERT_NOT_IMPLEMENTED(false); /* FIXME i#1569 */
+    int opc = instr_get_opcode(instr);
+    dr_pred_type_t pred = instr_get_predicate(instr);
+    CLIENT_ASSERT(instr_is_cbr(instr), "instr_invert_cbr: instr not a cbr");
+    if (opc == OP_cbnz) {
+        instr_set_opcode(instr, OP_cbz);
+    } else if (opc == OP_cbz) {
+        instr_set_opcode(instr, OP_cbnz);
+    } else if (opc == OP_tbnz) {
+        instr_set_opcode(instr, OP_tbz);
+    } else if (opc == OP_tbz) {
+        instr_set_opcode(instr, OP_tbnz);
+    } else {
+        instr_set_predicate(instr, instr_invert_predicate(pred));
+    }
 }
 
 bool
@@ -332,7 +391,8 @@ instr_predicate_is_cond(dr_pred_type_t pred)
 bool
 reg_is_gpr(reg_id_t reg)
 {
-    return (DR_REG_X0 <= reg && reg <= DR_REG_WSP);
+    return (reg >= DR_REG_START_64 && reg <= DR_REG_STOP_64) ||
+        (reg >= DR_REG_START_32 && reg <= DR_REG_STOP_32);
 }
 
 bool
@@ -413,6 +473,12 @@ reg_is_fp(reg_id_t reg)
 }
 
 bool
+reg_is_z(reg_id_t reg)
+{
+    return DR_REG_Z0 <= reg && reg <= DR_REG_Z31;
+}
+
+bool
 instr_is_nop(instr_t *instr)
 {
     uint opc = instr_get_opcode(instr);
@@ -445,6 +511,60 @@ instr_writes_thread_register(instr_t *instr)
     return (instr_get_opcode(instr) == OP_msr && instr_num_dsts(instr) == 1 &&
             opnd_is_reg(instr_get_dst(instr, 0)) &&
             opnd_get_reg(instr_get_dst(instr, 0)) == DR_REG_TPIDR_EL0);
+}
+
+/* Identify one of the reg-reg moves inserted as part of stolen reg mangling:
+ *   +0    m4  f9000380   str    %x0 -> (%x28)[8byte]
+ * Move stolen reg to x0:
+ *   +4    m4  aa1c03e0   orr    %xzr %x28 lsl $0x0000000000000000 -> %x0
+ *   +8    m4  f9401b9c   ldr    +0x30(%x28)[8byte] -> %x28
+ *   +12   L3  f81e0ffc   str    %x28 %sp $0xffffffffffffffe0 -> -0x20(%sp)[8byte] %sp
+ * Move x0 back to stolenr eg:
+ *   +16   m4  aa0003fc   orr    %xzr %x0 lsl $0x0000000000000000 -> %x28
+ *   +20   m4  f9400380   ldr    (%x28)[8byte] -> %x0
+ */
+bool
+instr_is_stolen_reg_move(instr_t *instr, bool *save, reg_id_t *reg)
+{
+    CLIENT_ASSERT(instr != NULL, "internal error: NULL argument");
+    if (instr_is_app(instr) || instr_get_opcode(instr) != OP_orr)
+        return false;
+    ASSERT(instr_num_srcs(instr) == 4 && instr_num_dsts(instr) == 1 &&
+           opnd_is_reg(instr_get_src(instr, 1)) && opnd_is_reg(instr_get_dst(instr, 0)));
+    if (opnd_get_reg(instr_get_src(instr, 1)) == dr_reg_stolen) {
+        if (save != NULL)
+            *save = true;
+        if (reg != NULL) {
+            *reg = opnd_get_reg(instr_get_dst(instr, 0));
+            ASSERT(*reg != dr_reg_stolen);
+        }
+        return true;
+    }
+    if (opnd_get_reg(instr_get_dst(instr, 0)) == dr_reg_stolen) {
+        if (save != NULL)
+            *save = false;
+        if (reg != NULL)
+            *reg = opnd_get_reg(instr_get_src(instr, 0));
+        return true;
+    }
+    return false;
+}
+
+DR_API
+bool
+instr_is_exclusive_load(instr_t *instr)
+{
+    switch (instr_get_opcode(instr)) {
+    case OP_ldaxp:
+    case OP_ldaxr:
+    case OP_ldaxrb:
+    case OP_ldaxrh:
+    case OP_ldxp:
+    case OP_ldxr:
+    case OP_ldxrb:
+    case OP_ldxrh: return true;
+    }
+    return false;
 }
 
 DR_API
@@ -480,4 +600,26 @@ instr_is_gather(instr_t *instr)
     /* FIXME i#3837: add support. */
     ASSERT_NOT_IMPLEMENTED(false);
     return false;
+}
+
+dr_pred_type_t
+instr_invert_predicate(dr_pred_type_t pred)
+{
+    switch (pred) {
+    case DR_PRED_EQ: return DR_PRED_NE;
+    case DR_PRED_NE: return DR_PRED_EQ;
+    case DR_PRED_CS: return DR_PRED_CC;
+    case DR_PRED_CC: return DR_PRED_CS;
+    case DR_PRED_MI: return DR_PRED_PL;
+    case DR_PRED_PL: return DR_PRED_MI;
+    case DR_PRED_VS: return DR_PRED_VC;
+    case DR_PRED_VC: return DR_PRED_VS;
+    case DR_PRED_HI: return DR_PRED_LS;
+    case DR_PRED_LS: return DR_PRED_HI;
+    case DR_PRED_GE: return DR_PRED_LT;
+    case DR_PRED_LT: return DR_PRED_GE;
+    case DR_PRED_GT: return DR_PRED_LE;
+    case DR_PRED_LE: return DR_PRED_GT;
+    default: CLIENT_ASSERT(false, "Incorrect predicate value"); return DR_PRED_NONE;
+    }
 }

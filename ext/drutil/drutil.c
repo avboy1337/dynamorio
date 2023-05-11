@@ -1,6 +1,7 @@
 /* **********************************************************
- * Copyright (c) 2011-2018 Google, Inc.  All rights reserved.
+ * Copyright (c) 2011-2022 Google, Inc.  All rights reserved.
  * Copyright (c) 2008-2010 VMware, Inc.  All rights reserved.
+ * Copyright (c) 2022      Arm Limited   All rights reserved.
  * **********************************************************/
 
 /* drutil: DynamoRIO Instrumentation Utilities
@@ -166,7 +167,12 @@ static bool
 drutil_insert_get_mem_addr_arm(void *drcontext, instrlist_t *bb, instr_t *where,
                                opnd_t memref, reg_id_t dst, reg_id_t scratch,
                                OUT bool *scratch_used);
-#endif /* X86/ARM */
+#elif defined(RISCV64)
+static bool
+drutil_insert_get_mem_addr_riscv64(void *drcontext, instrlist_t *bb, instr_t *where,
+                                   opnd_t memref, reg_id_t dst, reg_id_t scratch,
+                                   OUT bool *scratch_used);
+#endif /* X86/ARM/RISCV64 */
 
 /* Could be optimized to have scratch==dst for many common cases, but
  * need way to get a 2nd reg for corner cases: simpler to ask caller
@@ -192,6 +198,9 @@ drutil_insert_get_mem_addr_ex(void *drcontext, instrlist_t *bb, instr_t *where,
 #elif defined(AARCHXX)
     return drutil_insert_get_mem_addr_arm(drcontext, bb, where, memref, dst, scratch,
                                           scratch_used);
+#elif defined(RISCV64)
+    return drutil_insert_get_mem_addr_riscv64(drcontext, bb, where, memref, dst, scratch,
+                                              scratch_used);
 #endif
 }
 
@@ -206,6 +215,9 @@ drutil_insert_get_mem_addr(void *drcontext, instrlist_t *bb, instr_t *where,
 #elif defined(AARCHXX)
     return drutil_insert_get_mem_addr_arm(drcontext, bb, where, memref, dst, scratch,
                                           NULL);
+#elif defined(RISCV64)
+    return drutil_insert_get_mem_addr_riscv64(drcontext, bb, where, memref, dst, scratch,
+                                              NULL);
 #endif
 }
 
@@ -422,6 +434,18 @@ drutil_insert_get_mem_addr_arm(void *drcontext, instrlist_t *bb, instr_t *where,
             disp = -disp;
             negated = !negated;
         }
+#    ifdef AARCH64
+        /* In cases where only the lower 32 bits of the index register are
+         * used, we need to widen to 64 bits in order to handle stolen
+         * register's replacement. See replace_stolen_reg() below, where index
+         * is narrowed after replacement.
+         */
+        bool is_index_32bit_stolen = false;
+        if (index == reg_64_to_32(stolen)) {
+            index = stolen;
+            is_index_32bit_stolen = true;
+        }
+#    endif
         if (dst == stolen || scratch == stolen)
             return false;
         if (base == stolen) {
@@ -430,6 +454,13 @@ drutil_insert_get_mem_addr_arm(void *drcontext, instrlist_t *bb, instr_t *where,
         } else if (index == stolen) {
             index = replace_stolen_reg(drcontext, bb, where, memref, dst, scratch,
                                        scratch_used);
+#    ifdef AARCH64
+            /* Narrow replaced index register if it was 32 bit stolen register
+             * before replace_stolen_reg() call.
+             */
+            if (is_index_32bit_stolen)
+                index = reg_64_to_32(index);
+#    endif
         }
         if (index == REG_NULL && opnd_get_disp(memref) != 0) {
             /* first try "add dst, base, #disp" */
@@ -490,7 +521,17 @@ drutil_insert_get_mem_addr_arm(void *drcontext, instrlist_t *bb, instr_t *where,
     }
     return true;
 }
-#endif     /* X86/AARCHXX */
+#elif defined(RISCV64)
+static bool
+drutil_insert_get_mem_addr_riscv64(void *drcontext, instrlist_t *bb, instr_t *where,
+                                   opnd_t memref, reg_id_t dst, reg_id_t scratch,
+                                   OUT bool *scratch_used)
+{
+    /* FIXME i#3544: Not implemented */
+    ASSERT(false, "Not implemented");
+    return false;
+}
+#endif /* X86/AARCHXX/RISCV64 */
 
 DR_EXPORT
 uint
@@ -594,6 +635,17 @@ create_nonloop_stringop(void *drcontext, instr_t *inst)
 
 DR_EXPORT
 bool
+drutil_instr_is_stringop_loop(instr_t *inst)
+{
+#ifdef X86
+    return opc_is_stringop_loop(instr_get_opcode(inst));
+#else
+    return false;
+#endif
+}
+
+DR_EXPORT
+bool
 drutil_expand_rep_string_ex(void *drcontext, instrlist_t *bb, bool *expanded OUT,
                             instr_t **stringop OUT)
 {
@@ -680,6 +732,24 @@ drutil_expand_rep_string_ex(void *drcontext, instrlist_t *bb, bool *expanded OUT
         ASSERT(opnd_uses_reg(xcx, DR_REG_XCX), "rep string opnd order mismatch");
         ASSERT(inst == instrlist_last(bb), "repstr not alone in bb");
 
+        emulated_instr_t emulated_instr;
+        emulated_instr.size = sizeof(emulated_instr);
+        emulated_instr.pc = xl8;
+        emulated_instr.instr = inst;
+        /* We can't place an end label after our conditional branch as DR won't
+         * allow anything past the branch (we explored relaxing that and ran into
+         * many complexities that were not worth further work), so we instead
+         * use the flag to mark the whole block as emulated.
+         */
+        emulated_instr.flags = DR_EMULATE_REST_OF_BLOCK |
+            /* This is a different type of emulation where we want
+             * observational clients to look at the original instruction for instruction
+             * fetch info but the emulation sequence for data load/store info.  We use
+             * this flag in emulated_instr_t to indicate this.
+             */
+            DR_EMULATE_INSTR_ONLY;
+        drmgr_insert_emulation_start(drcontext, bb, inst, &emulated_instr);
+
         pre_loop = INSTR_CREATE_label(drcontext);
         /* hack to handle loop decrementing xcx: simpler if could have 2 cbrs! */
         if (opnd_get_size(xcx) == OPSZ_8) {
@@ -724,9 +794,11 @@ drutil_expand_rep_string_ex(void *drcontext, instrlist_t *bb, bool *expanded OUT
         instr_set_dst(loop, 0, xcx);
         PREXL8(bb, inst, INSTR_XL8(loop, fake_xl8));
 
-        /* now throw out the orig instr */
+        /* Now throw out the original instr.  It is part of the emulation label
+         * and will be freed along with the instrlist so we just remove it from
+         * the list and do not free it ourselves.
+         */
         instrlist_remove(bb, inst);
-        instr_destroy(drcontext, inst);
 
         if (expanded != NULL)
             *expanded = true;

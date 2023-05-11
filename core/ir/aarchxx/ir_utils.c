@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2014-2020 Google, Inc.  All rights reserved.
+ * Copyright (c) 2014-2021 Google, Inc.  All rights reserved.
  * Copyright (c) 2016 ARM Limited. All rights reserved.
  * **********************************************************/
 
@@ -32,7 +32,7 @@
  */
 
 #include "../globals.h"
-#include "instr_create.h"
+#include "instr_create_shared.h"
 #include "instrument.h"
 
 /* Make code more readable by shortening long lines.
@@ -162,6 +162,7 @@ convert_to_near_rel_arch(dcontext_t *dcontext, instrlist_t *ilist, instr_t *inst
 #endif
 }
 
+/* Keep this in sync with patch_mov_immed_arch(). */
 void
 insert_mov_immed_arch(dcontext_t *dcontext, instr_t *src_inst, byte *encode_estimate,
                       ptr_int_t val, opnd_t dst, instrlist_t *ilist, instr_t *instr,
@@ -189,7 +190,9 @@ insert_mov_immed_arch(dcontext_t *dcontext, instr_t *src_inst, byte *encode_esti
         val = (ptr_int_t)encode_estimate;
 
     /* movz x(dst), #(val & 0xffff) */
-    mov = INSTR_CREATE_movz(dcontext, dst, OPND_CREATE_INT16(val & 0xffff),
+    mov = INSTR_CREATE_movz(dcontext, dst,
+                            src_inst == NULL ? OPND_CREATE_INT16(val & 0xffff)
+                                             : opnd_create_instr_ex(src_inst, OPSZ_2, 0),
                             OPND_CREATE_INT8(0));
     PRE(ilist, instr, mov);
     if (first != NULL)
@@ -198,7 +201,9 @@ insert_mov_immed_arch(dcontext_t *dcontext, instr_t *src_inst, byte *encode_esti
         if ((val >> (16 * i) & 0xffff) != 0) {
             /* movk x(dst), #(val >> sh & 0xffff), lsl #(sh) */
             mov = INSTR_CREATE_movk(dcontext, dst,
-                                    OPND_CREATE_INT16((val >> 16 * i) & 0xffff),
+                                    src_inst == NULL
+                                        ? OPND_CREATE_INT16((val >> 16 * i) & 0xffff)
+                                        : opnd_create_instr_ex(src_inst, OPSZ_2, 16 * i),
                                     OPND_CREATE_INT8(i * 16));
             PRE(ilist, instr, mov);
         }

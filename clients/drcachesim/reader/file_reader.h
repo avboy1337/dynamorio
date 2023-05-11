@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2016-2020 Google, Inc.  All rights reserved.
+ * Copyright (c) 2016-2023 Google, Inc.  All rights reserved.
  * **********************************************************/
 
 /*
@@ -38,6 +38,7 @@
 #ifndef _FILE_READER_H_
 #define _FILE_READER_H_ 1
 
+#include <inttypes.h>
 #include <string.h>
 #include <fstream>
 #include <queue>
@@ -46,6 +47,7 @@
 #include "memref.h"
 #include "directory_iterator.h"
 #include "trace_entry.h"
+#include "utils.h"
 
 #ifndef ZHEX64_FORMAT_STRING
 /* We avoid dr_defines.h to keep this code separated and simpler for using with
@@ -54,237 +56,123 @@
 #    ifdef WINDOWS
 #        define ZHEX64_FORMAT_STRING "%016I64x"
 #    else
-#        if defined(__i386__) || defined(__arm__) || defined(__APPLE__)
-#            define ZHEX64_FORMAT_STRING "%016llx"
-#        else
-#            define ZHEX64_FORMAT_STRING "%016lx"
-#        endif
+#        define ZHEX64_FORMAT_STRING "%" PRIx64
 #    endif
 #endif
 
-/* We templatize on the file type itself for specializing for compression and
+/**
+ * We templatize on the file type itself for specializing for compression and
  * other different types.  An alternative would be to require a std::istream
  * interface and add gzip_istream_t (paralleling gzip_ostream_t used for
  * raw2trace).
  */
 template <typename T> class file_reader_t : public reader_t {
 public:
-    file_reader_t()
-    {
-    }
+    file_reader_t();
     file_reader_t(const std::string &path, int verbosity = 0)
         : reader_t(verbosity, "[file_reader]")
         , input_path_(path)
     {
-    }
-    explicit file_reader_t(const std::vector<std::string> &path_list, int verbosity = 0)
-        : reader_t(verbosity, "[file_reader]")
-        , input_path_list_(path_list)
-    {
+        online_ = false;
     }
     virtual ~file_reader_t();
     bool
     init() override
     {
         at_eof_ = false;
-        if (!open_input_files())
+        if (!open_input_file())
             return false;
         ++*this;
         return true;
     }
 
-    virtual bool
-    is_complete();
+    std::string
+    get_stream_name() const override
+    {
+        size_t ind = input_path_.find_last_of(DIRSEP);
+        if (ind == std::string::npos)
+            return input_path_;
+        return input_path_.substr(ind + 1);
+    }
 
 protected:
-    bool
-    read_next_thread_entry(size_t thread_index, OUT trace_entry_t *entry,
-                           OUT bool *eof) override;
+    trace_entry_t *
+    read_next_entry() override;
 
     virtual bool
     open_single_file(const std::string &path);
 
     virtual bool
-    open_input_files()
+    open_input_file()
     {
-        if (!input_path_list_.empty()) {
-            for (const std::string &path : input_path_list_) {
-                if (!open_single_file(path)) {
-                    ERRMSG("Failed to open %s\n", path.c_str());
-                    return false;
-                }
-            }
-        } else if (directory_iterator_t::is_directory(input_path_)) {
-            VPRINT(this, 1, "Iterating directory %s\n", input_path_.c_str());
-            directory_iterator_t end;
-            directory_iterator_t iter(input_path_);
-            if (!iter) {
-                ERRMSG("Failed to list directory %s: %s", input_path_.c_str(),
-                       iter.error_string().c_str());
-                return false;
-            }
-            for (; iter != end; ++iter) {
-                std::string fname = *iter;
-                if (fname == "." || fname == "..")
-                    continue;
-                // Skip the auxiliary files.
-                if (fname == DRMEMTRACE_MODULE_LIST_FILENAME ||
-                    fname == DRMEMTRACE_FUNCTION_LIST_FILENAME)
-                    continue;
-                VPRINT(this, 2, "Found file %s\n", fname.c_str());
-                if (!open_single_file(input_path_ + DIRSEP + fname)) {
-                    ERRMSG("Failed to open %s\n", fname.c_str());
-                    return false;
-                }
-            }
-        } else {
-            if (!open_single_file(input_path_)) {
-                ERRMSG("Failed to open %s\n", input_path_.c_str());
-                return false;
-            }
-        }
-        if (input_files_.empty()) {
-            ERRMSG("No thread files found.");
+        if (!open_single_file(input_path_)) {
+            ERRMSG("Failed to open %s\n", input_path_.c_str());
             return false;
         }
 
-        thread_count_ = input_files_.size();
-        queues_.resize(input_files_.size());
-        tids_.resize(input_files_.size());
-        timestamps_.resize(input_files_.size());
-        times_.resize(input_files_.size(), 0);
-        // We can't take the address of a vector<bool> element so we use a raw array.
-        thread_eof_ = new bool[input_files_.size()];
-        memset(thread_eof_, 0, input_files_.size() * sizeof(*thread_eof_));
-
-        // First read the tid and pid entries which precede any timestamps_.
+        // First read the tid and pid entries which precede any timestamps.
         // We hand out the tid to the output on every thread switch, and the pid
         // the very first time for the thread.
-        trace_entry_t header, pid;
-        for (index_ = 0; index_ < input_files_.size(); ++index_) {
-            if (!read_next_thread_entry(index_, &header, &thread_eof_[index_]) ||
-                !read_next_thread_entry(index_, &tids_[index_], &thread_eof_[index_]) ||
-                !read_next_thread_entry(index_, &pid, &thread_eof_[index_])) {
-                ERRMSG("Failed to read header fields from input file #%zu\n", index_);
-                return false;
-            }
-            VPRINT(this, 2, "Read thread #%zd header: ver=%zu, pid=%zu, tid=%zu\n",
-                   index_, header.addr, pid.addr, tids_[index_].addr);
-            if (header.type != TRACE_TYPE_HEADER || header.addr != TRACE_ENTRY_VERSION ||
-                pid.type != TRACE_TYPE_PID || tids_[index_].type != TRACE_TYPE_THREAD) {
-                ERRMSG("Invalid header for input file #%zu\n", index_);
-                return false;
-            }
-            // The reader expects us to own the header and pass the tid as
-            // the first entry.
-            queues_[index_].push(tids_[index_]);
-            queues_[index_].push(pid);
+        trace_entry_t *entry;
+        trace_entry_t header = {}, pid = {}, tid = {};
+        entry = read_next_entry();
+        if (entry == nullptr || entry->type != TRACE_TYPE_HEADER) {
+            ERRMSG("Invalid header\n");
+            return false;
         }
-        index_ = input_files_.size();
-
+        header = *entry;
+        // We can handle the older version 1 as well which simply omits the
+        // early marker with the arch tag, and version 2 which only differs wrt
+        // TRACE_MARKER_TYPE_KERNEL_EVENT.
+        if (entry->addr > TRACE_ENTRY_VERSION) {
+            ERRMSG("Cannot handle version #%zu (expect version <= #%u)\n", entry->addr,
+                   TRACE_ENTRY_VERSION);
+            return false;
+        }
+        // Read the meta entries until we hit the pid.
+        // We want to pass the tid+pid to the reader *before* any markers,
+        // even though markers can precede the tid+pid in the file, in particular
+        // for legacy traces.
+        std::queue<trace_entry_t> marker_queue;
+        while ((entry = read_next_entry()) != nullptr) {
+            if (entry->type == TRACE_TYPE_PID) {
+                // We assume the pid entry is after the tid.
+                pid = *entry;
+                break;
+            } else if (entry->type == TRACE_TYPE_THREAD)
+                tid = *entry;
+            else if (entry->type == TRACE_TYPE_MARKER)
+                marker_queue.push(*entry);
+            else {
+                ERRMSG("Unexpected trace sequence\n");
+                return false;
+            }
+        }
+        VPRINT(this, 2, "Read header: ver=%zu, pid=%zu, tid=%zu\n", header.addr, pid.addr,
+               tid.addr);
+        // The reader expects us to own the header and pass the tid as
+        // the first entry.
+        queue_.push(tid);
+        queue_.push(pid);
+        while (!marker_queue.empty()) {
+            queue_.push(marker_queue.front());
+            marker_queue.pop();
+        }
         return true;
     }
 
-    trace_entry_t *
-    read_next_entry() override
+    // Provided so that instantiations can specialize.
+    reader_t &
+    skip_instructions(uint64_t instruction_count) override
     {
-        // We read the thread files simultaneously in lockstep and merge them into
-        // a single interleaved stream in times_tamp order.
-        // When a thread file runs out we leave its times_[] entry as 0 and its file at
-        // eof.
-        while (thread_count_ > 0) {
-            if (index_ >= input_files_.size()) {
-                // Pick the next thread by looking for the smallest times_tamp.
-                uint64_t min_time = 0xffffffffffffffff;
-                size_t next_index = 0;
-                for (size_t i = 0; i < times_.size(); ++i) {
-                    if (times_[i] == 0 && !thread_eof_[i]) {
-                        if (!read_next_thread_entry(i, &timestamps_[i],
-                                                    &thread_eof_[i])) {
-                            ERRMSG("Failed to read from input file #%zu\n", i);
-                            return nullptr;
-                        }
-                        if (timestamps_[i].type != TRACE_TYPE_MARKER &&
-                            timestamps_[i].size != TRACE_MARKER_TYPE_TIMESTAMP) {
-                            ERRMSG("Missing times_tamp entry in input file #%zu\n", i);
-                            return nullptr;
-                        }
-                        times_[i] = timestamps_[i].addr;
-                        VPRINT(this, 3,
-                               "Thread #%zu times_tamp is @0x" ZHEX64_FORMAT_STRING "\n",
-                               i, times_[i]);
-                    }
-                    if (times_[i] != 0 && times_[i] < min_time) {
-                        min_time = times_[i];
-                        next_index = i;
-                    }
-                }
-                VPRINT(this, 2,
-                       "Next thread in times_tamp order is #%zu @0x" ZHEX64_FORMAT_STRING
-                       "\n",
-                       next_index, times_[next_index]);
-                index_ = next_index;
-                times_[index_] = 0; // Read from file for this thread's next times_tamp.
-                // If the queue is not empty, it should contain the initial tid;pid.
-                if ((queues_[index_].empty() ||
-                     queues_[index_].front().type != TRACE_TYPE_THREAD) &&
-                    // For a single thread (or already-interleaved file) we do not need
-                    // thread entries before each times_tamp.
-                    input_files_.size() > 1)
-                    queues_[index_].push(tids_[index_]);
-                queues_[index_].push(timestamps_[index_]);
-            }
-            if (!queues_[index_].empty()) {
-                entry_copy_ = queues_[index_].front();
-                queues_[index_].pop();
-                return &entry_copy_;
-            }
-            VPRINT(this, 4, "About to read thread #%zu\n", index_);
-            if (!read_next_thread_entry(index_, &entry_copy_, &thread_eof_[index_])) {
-                if (thread_eof_[index_]) {
-                    VPRINT(this, 2, "Thread #%zu at eof\n", index_);
-                    --thread_count_;
-                    if (thread_count_ == 0) {
-                        VPRINT(this, 2, "All threads at eof\n");
-                        at_eof_ = true;
-                        break;
-                    }
-                    times_[index_] = 0;
-                    index_ = input_files_.size(); // Request thread scan.
-                    continue;
-                } else {
-                    ERRMSG("Failed to read from input file #%zu\n", index_);
-                    return nullptr;
-                }
-            }
-            if (entry_copy_.type == TRACE_TYPE_MARKER &&
-                entry_copy_.size == TRACE_MARKER_TYPE_TIMESTAMP) {
-                VPRINT(this, 3, "Thread #%zu times_tamp 0x" ZHEX64_FORMAT_STRING "\n",
-                       index_, (uint64_t)entry_copy_.addr);
-                times_[index_] = entry_copy_.addr;
-                timestamps_[index_] = entry_copy_;
-                index_ = input_files_.size(); // Request thread scan.
-                continue;
-            }
-            return &entry_copy_;
-        }
-        return nullptr;
+        return reader_t::skip_instructions(instruction_count);
     }
+
+    // Protected for access by mock_file_reader_t.
+    T input_file_;
 
 private:
     std::string input_path_;
-    std::vector<std::string> input_path_list_;
-    std::vector<T> input_files_;
-    trace_entry_t entry_copy_;
-    // The current thread we're processing is "index".  If it's set to input_files_.size()
-    // that means we need to pick a new thread.
-    size_t index_;
-    size_t thread_count_;
-    std::vector<std::queue<trace_entry_t>> queues_;
-    std::vector<trace_entry_t> tids_;
-    std::vector<trace_entry_t> timestamps_;
-    std::vector<uint64_t> times_;
-    bool *thread_eof_ = nullptr;
 };
 
 #endif /* _FILE_READER_H_ */

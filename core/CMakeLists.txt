@@ -1,5 +1,5 @@
 # **********************************************************
-# Copyright (c) 2010-2020 Google, Inc.    All rights reserved.
+# Copyright (c) 2010-2021 Google, Inc.    All rights reserved.
 # Copyright (c) 2009-2010 VMware, Inc.    All rights reserved.
 # **********************************************************
 
@@ -34,6 +34,9 @@ include(../make/policies.cmake NO_POLICY_SCOPE)
 ###########################################################################
 # Sources and targets
 
+# Used to share exported headers with clients.
+add_definitions(-DDYNAMORIO_INTERNAL)
+
 # we have no exe's here, and we want our dll's in the lib dir
 # (could use MODULE instead of SHARED if it would let us link)
 set(EXECUTABLE_OUTPUT_DIRECTORY "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
@@ -61,19 +64,54 @@ function (add_gen_events_deps target)
 endfunction (add_gen_events_deps)
 
 if (AARCH64)
-  # Required for opcode.h and codec headers, which are auto-generated on AArch64.
+  # Required for opcode_api.h and codec headers, which are auto-generated on AArch64.
   include(../make/CMake_aarch64_gen_codec.cmake)
   add_custom_target(gen_aarch64_codec DEPENDS "${AARCH64_CODEC_GEN_SRCS}")
   include_directories(BEFORE ${PROJECT_BINARY_DIR})
+  # Export the generated opcode header.  Use a custom target and command to avoid
+  # repeated re-copying (a POST_BUILD with copy_if_different doesn't seem to work how
+  # it should: it still runs the command every time, though it doesn't copy anything).
+  set(aarch64_exported_opcodes ${BUILD_INCLUDE}/dr_ir_opcodes_aarch64.h)
+  add_custom_target(gen_aarch64_opcodes DEPENDS ${aarch64_exported_opcodes})
+  add_custom_command(OUTPUT ${aarch64_exported_opcodes}
+    DEPENDS ${PROJECT_BINARY_DIR}/opcode_api.h
+    COMMAND ${CMAKE_COMMAND}
+    ARGS -E copy ${PROJECT_BINARY_DIR}/opcode_api.h
+    ${aarch64_exported_opcodes} VERBATIM)
+endif ()
+
+if (RISCV64)
+  # Required for opcode_api.h and codec headers, which are auto-generated on RISC-V.
+  include(../make/CMake_riscv64_gen_codec.cmake)
+  add_custom_target(gen_riscv64_codec DEPENDS "${RISCV64_CODEC_GEN_SRCS}")
+  include_directories(BEFORE ${PROJECT_BINARY_DIR})
+  # Export the generated headers.  Use a custom target and command to avoid
+  # repeated re-copying (a POST_BUILD with copy_if_different doesn't seem to work how
+  # it should: it still runs the command every time, though it doesn't copy anything).
+  set(riscv64_exported_opcodes ${BUILD_INCLUDE}/dr_ir_opcodes_riscv64.h)
+  set(riscv64_exported_instr ${BUILD_INCLUDE}/dr_ir_macros_riscv64.h)
+  add_custom_target(gen_riscv64_headers DEPENDS
+                                          ${riscv64_exported_opcodes}
+                                          ${riscv64_exported_instr})
+  add_custom_command(OUTPUT ${riscv64_exported_opcodes}
+    DEPENDS ${PROJECT_BINARY_DIR}/opcode_api.h
+    COMMAND ${CMAKE_COMMAND}
+    ARGS -E copy ${PROJECT_BINARY_DIR}/opcode_api.h
+    ${riscv64_exported_opcodes} VERBATIM)
+  add_custom_command(OUTPUT ${riscv64_exported_instr}
+    DEPENDS ${PROJECT_BINARY_DIR}/instr_create_api.h
+    COMMAND ${CMAKE_COMMAND}
+    ARGS -E copy ${PROJECT_BINARY_DIR}/instr_create_api.h
+    ${riscv64_exported_instr} VERBATIM)
 endif ()
 
 set(asm_deps
   "${PROJECT_SOURCE_DIR}/core/arch/asm_defines.asm"
   "${PROJECT_BINARY_DIR}/configure.h")
-add_asm_target(arch/${ARCH_NAME}/${ARCH_NAME}.asm arch_core_asm_src arch_core_asm_tgt
-  "_core" "" "${asm_deps}")
-if (NOT "${ARCH_NAME}" STREQUAL "${ARCH_NAME_SHARED}")
-  add_asm_target(arch/${ARCH_NAME_SHARED}/${ARCH_NAME_SHARED}.asm
+add_asm_target(arch/${DR_HOST_ARCH_NAME}/${DR_HOST_ARCH_NAME}.asm
+  arch_core_asm_src arch_core_asm_tgt "_core" "" "${asm_deps}")
+if (NOT "${DR_HOST_ARCH_NAME}" STREQUAL "${DR_HOST_ARCH_NAME_SHARED}")
+  add_asm_target(arch/${DR_HOST_ARCH_NAME_SHARED}/${DR_HOST_ARCH_NAME_SHARED}.asm
     archshared_core_asm_src archshared_core_asm_tgt
     "_core" "" "${asm_deps}")
 endif ()
@@ -86,11 +124,11 @@ if (UNIX)
   # our auxiliary tools (i#1504), but we do *not* want our own memcpy and
   # memset for static-lib DR core.  Thus we separate them out.  The i#1504
   # glibc versioning is only an issue on x86.
-  add_asm_target(arch/${ARCH_NAME}/memfuncs.asm memfuncs_asm_src memfuncs_asm_tgt
+  add_asm_target(arch/${DR_HOST_ARCH_NAME}/memfuncs.asm memfuncs_asm_src memfuncs_asm_tgt
     "_memfuncs" "" "${asm_deps}")
   add_library(drmemfuncs STATIC ${memfuncs_asm_src} lib/memmove.c)
   add_gen_events_deps(drmemfuncs)
-  if (CLIENT_INTERFACE OR APP_EXPORTS)
+  if (APP_EXPORTS)
     add_dependencies(drmemfuncs api_headers)
   endif ()
 endif ()
@@ -98,7 +136,7 @@ endif ()
 # i#1409: to share core libc-ish code with non-core, we use the "drlibc" library.
 add_asm_target(drlibc/drlibc_xarch.asm drlibc_xarch_asm_src drlibc_xarch_asm_tgt
   "_core" "" "${asm_deps}")
-add_asm_target(drlibc/drlibc_${ARCH_NAME}.asm drlibc_arch_asm_src
+add_asm_target(drlibc/drlibc_${DR_HOST_ARCH_NAME}.asm drlibc_arch_asm_src
   drlibc_arch_asm_tgt
   "" "" "${asm_deps}")
 set(DRLIBC_SRCS
@@ -106,6 +144,8 @@ set(DRLIBC_SRCS
   ${drlibc_arch_asm_src}
   drlibc/drlibc.c
   drlibc/drlibc_notdr_dcxt.c
+  drlibc/drlibc_notdr_error.c
+  drlibc/drlibc_notdr_ignoreassert.c
   drlibc/drlibc_notdr_logfile.c
   drlibc/drlibc_notdr_printlog.c
   drlibc/drlibc_notdr_report.c
@@ -128,6 +168,8 @@ endif ()
 add_gen_events_deps(drlibc)
 if (AARCH64)
   add_dependencies(drlibc gen_aarch64_codec)
+elseif (RISCV64)
+add_dependencies(drlibc gen_riscv64_codec)
 endif (AARCH64)
 if (WIN32 AND "${CMAKE_GENERATOR}" MATCHES "Visual Studio")
   # for parallel build correctness we need a target dependence
@@ -162,6 +204,7 @@ set(CORE_SRCS
   io.c
   native_exec.c
   lib/instrument.c
+  lib/module_api.c
   translate.c
   annotations.c
   jit_opt.c
@@ -258,12 +301,16 @@ elseif (AARCH64)
   set(DECODER_SRCS ${DECODER_SRCS}
     ir/${ARCH_NAME}/codec.c
     ir/${ARCH_NAME}/build_ldstex.c)
+elseif (RISCV64)
+  set(DECODER_SRCS ${DECODER_SRCS}
+    ir/${ARCH_NAME}/codec.c)
 endif ()
 
 set(ARCH_SRCS
   arch/arch.c
   arch/emit_utils_shared.c
   arch/${ARCH_NAME}/emit_utils.c
+  arch/${ARCH_NAME_SHARED}/emit_utils.c
   # TODO i#1684: Link with drdecode rather than compiling all the same files.
   ${DECODER_SRCS}
   arch/interp.c
@@ -273,7 +320,6 @@ set(ARCH_SRCS
   arch/${ARCH_NAME_SHARED}/mangle.c
   arch/clean_call_opt_shared.c
   arch/${ARCH_NAME}/clean_call_opt.c
-  arch/steal_reg.c
   arch/x86_code.c
   ${arch_core_asm_src}
   ${archshared_core_asm_src}
@@ -396,8 +442,8 @@ else (UNIX)
     win32/syscall.c
     win32/callback.c
     win32/drmarker.c
-    win32/ntdll.c
     win32/ntdll_shared.c
+    win32/ntdll.c
     win32/inject.c
     win32/inject_shared.c
     win32/module.c
@@ -421,8 +467,8 @@ else (UNIX)
    )
   set(PRELOAD_SRCS
     win32/pre_inject.c
-    win32/ntdll.c
     win32/ntdll_shared.c
+    win32/ntdll.c
     win32/inject_shared.c
     win32/drmarker.c
     ${preinject_asm_src}
@@ -436,10 +482,10 @@ else (UNIX)
   set(INJECTOR_SRCS
     win32/injector.c
     win32/inject.c
-    win32/ntdll.c
     win32/inject_shared.c
     win32/module_shared.c
     win32/ntdll_shared.c
+    win32/ntdll.c
     win32/resources.rc
     config.c
     win32/os.c
@@ -451,7 +497,7 @@ else (UNIX)
     win32/resources.rc
     )
   set_target_properties(drearlyhelp1 PROPERTIES
-    COMPILE_FLAGS "-DRC_IS_EARLY1")
+    COMPILE_DEFINITIONS "RC_IS_EARLY1")
   # base = (release base - 64k)
   set_target_properties(drearlyhelp1 PROPERTIES
     # not bothering with map files
@@ -463,7 +509,7 @@ else (UNIX)
     win32/resources.rc
     )
   set_target_properties(drearlyhelp2 PROPERTIES
-    COMPILE_FLAGS "-DRC_IS_EARLY2")
+    COMPILE_DEFINITIONS "RC_IS_EARLY2")
   # base = (helper1 base - 64k)
   set_target_properties(drearlyhelp2 PROPERTIES
     # not bothering with map files
@@ -481,6 +527,8 @@ function (configure_core_lib target)
   add_gen_events_deps(${target})
   if (AARCH64)
     add_dependencies(${target} gen_aarch64_codec)
+  elseif (RISCV64)
+    add_dependencies(${target} gen_riscv64_codec)
   endif()
   if (WIN32)
     # Since we're forced to use link-line flags instead of target_link_libraries
@@ -499,7 +547,7 @@ function (configure_core_lib target)
   # rather than a separate BUILD_INCLUDES option we always build
   # include headers if building core (or if building docs or samples as
   # they have real dependencies)
-  if (CLIENT_INTERFACE OR APP_EXPORTS)
+  if (APP_EXPORTS)
     add_dependencies(${target} api_headers)
   endif ()
 
@@ -576,12 +624,7 @@ endfunction (configure_core_lib)
 
 add_library(dynamorio SHARED
   ${CORE_SRCS} ${ARCH_SRCS} ${OS_SRCS}
-  # FIXME: any other way to add a dependence?  this is for export_list,
-  # where the PRE_LINK custom command doesn't support DEPENDS.
-  # Apparently just files w/ certain extensions are pulled out of here
-  # for automatic rules.
-  ${CMAKE_CURRENT_SOURCE_DIR}/lib/genapi.pl
-  # ditto: adding here for dependence
+  # Adding here for dependence.
   ${PROJECT_SOURCE_DIR}/make/ldscript.cmake
   )
 
@@ -597,18 +640,9 @@ if (UNIX)
   append_property_string(TARGET dynamorio LINK_FLAGS "-Wl,${ld_entry_flag},_start")
 
   if (NOT HAVE_FVISIBILITY)
-    set(export_list ${CMAKE_CURRENT_BINARY_DIR}/exportlist)
-    add_custom_command(TARGET dynamorio
-      PRE_LINK
-      COMMAND ${PERL_EXECUTABLE}
-      ARGS ${CMAKE_CURRENT_SOURCE_DIR}/lib/genapi.pl
-           # we assume ">" will work in all supported shells
-           -filter "${defines}" > ${export_list}
-      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-      VERBATIM # recommended: p260
-      )
-    append_property_string(TARGET dynamorio LINK_FLAGS
-      "-Xlinker --version-script -Xlinker ${export_list}")
+    # We used to have the genapi.pl script build an linker script
+    # export list for us but we no longer support that.
+    message(FATAL_ERROR "-fvisibility is required to build")
   endif (NOT HAVE_FVISIBILITY)
 
   # This appends to LINK_FLAGS, so do it after we set them above.
@@ -643,9 +677,7 @@ if (UNIX)
       if (NOT APPLE)
         # i#46, i#1541, i#1459: we have zero dependencies now by default, except
         # for MacOS where privlib is NYI (i#1285) and static lib.
-        if (NOT VMSAFE AND NOT VPS) # XXX: these unsupported builds have deps
-          set(check_deps ON)
-        endif ()
+        set(check_deps ON)
       endif ()
       # i#2632: 32-bit recent clang release builds are inserting text relocs.
       # XXX: We don't support clang for official package builds until this is fixed.
@@ -661,7 +693,7 @@ if (UNIX)
         ARGS -D lib_fileloc=${CMAKE_CURRENT_BINARY_DIR}/${locvar_name}
              -D check_textrel=${check_textrel}
              -D check_deps=${check_deps}
-             -D check_libc=OFF
+             -D check_libc=${BUILD_PACKAGE}
              -D check_interp=ON
              -D READELF_EXECUTABLE=${READELF_EXECUTABLE}
              -P ${CMAKE_CURRENT_SOURCE_DIR}/CMake_readelf.cmake
@@ -683,12 +715,6 @@ else (UNIX)
   endif (X64)
   set(DEF_BLD ${CMAKE_CURRENT_BINARY_DIR}/dr_ntdll.def)
   file(READ ${DEF_SRC} string)
-  if (NOT CLIENT_INTERFACE)
-    # we're not exporting snprintf() so remove from def file */
-    string(REGEX REPLACE
-      " snprintf"
-      "" string "${string}")
-  endif (NOT CLIENT_INTERFACE)
   file(WRITE ${DEF_BLD} "${string}")
   set(FORWARD_TO_NTDLL "/def:\"${DEF_BLD}\" /ignore:4197")
 
@@ -736,13 +762,11 @@ else (UNIX)
     set(dynamorio_link_flags
       "${dynamorio_link_flags} /export:dr_app_running_under_dynamorio")
   endif (APP_EXPORTS)
-  if (CLIENT_INTERFACE)
-    set(dynamorio_link_flags "${dynamorio_link_flags} /export:dr_try_start")
-    set(dynamorio_link_flags "${dynamorio_link_flags} /export:dr_call_on_clean_stack")
-    if (NOT X64)
-      set(dynamorio_link_flags "${dynamorio_link_flags} /export:dr_invoke_x64_routine")
-    endif (NOT X64)
-  endif (CLIENT_INTERFACE)
+  set(dynamorio_link_flags "${dynamorio_link_flags} /export:dr_try_start")
+  set(dynamorio_link_flags "${dynamorio_link_flags} /export:dr_call_on_clean_stack")
+  if (NOT X64)
+    set(dynamorio_link_flags "${dynamorio_link_flags} /export:dr_invoke_x64_routine")
+  endif (NOT X64)
   if (WINDOWS)
     set(dynamorio_link_flags
       "${dynamorio_link_flags} /export:dynamorio_earliest_init_takeover")
@@ -765,7 +789,7 @@ else (UNIX)
   set_target_properties(dynamorio PROPERTIES LINK_FLAGS "${dynamorio_link_flags}")
 
   # ensure there are no dependencies other than ntdll
-  find_program(DUMPBIN_EXECUTABLE dumpbin.exe DOC "path to dumpbin.exe")
+  find_program(DUMPBIN_EXECUTABLE dumpbin.exe HINTS "${cl_path}" DOC "path to dumpbin.exe")
   if (DUMPBIN_EXECUTABLE)
     add_custom_command(TARGET dynamorio
       POST_BUILD
@@ -783,6 +807,11 @@ endif (UNIX)
 # DynamoRIO static core library
 
 # hide_symbols is only honored for UNIX.
+# i#3348, i#5574: Note that hide_symbols is not safe. It leads to confusing
+# behavior where different libraries may see different definitions of exported
+# symbols, without obeying WEAK. E.g. the weakly defined routines in drlibc will
+# not be overriden by their respective strong definitions in core DR, for the
+# callsites in drlibc itself.
 function (configure_static_core_lib name hide_symbols)
   add_library(${name} STATIC
     ${CORE_SRCS} ${ARCH_SRCS} ${OS_SRCS})
@@ -849,32 +878,29 @@ endfunction()
 
 # XXX i#1997: not fully supported on Mac yet
 if (NOT APPLE)
-  configure_static_core_lib(dynamorio_static ON)
-  if (UNIX AND BUILD_TESTS)
-    # Create a version without hidden symbols to support that model.
-    # The symbol hiding step is complex and for some toolchains it is simpler
-    # to avoid it and count on symbol names preventing collisions (i#3348).
-    configure_static_core_lib(dynamorio_static_nohide OFF)
-
-    if (LINUX AND READELF_EXECUTABLE)
-      # We already located readelf above for the shared lib.
-      # We also already created a loc.cmake file in configure_static_core_lib.
-      set(locvar_name dynamorio_static_nohide_loc)
-      add_custom_command(TARGET dynamorio_static_nohide
-        POST_BUILD
-        COMMAND ${CMAKE_COMMAND}
-        ARGS -D lib_fileloc=${CMAKE_CURRENT_BINARY_DIR}/${locvar_name}
-             -D READELF_EXECUTABLE=${READELF_EXECUTABLE}
-             -D CMAKE_SYSTEM_PROCESSOR=${CMAKE_SYSTEM_PROCESSOR}
-             -D X86=${X86}
-             -D X64=${X64}
-             -D DEBUG=${DEBUG}
-             -P ${CMAKE_CURRENT_SOURCE_DIR}/CMake_symbol_check.cmake
-        VERBATIM
-        )
-    endif ()
+  # We do not hide symbols while building dynamorio_static, because it is unsafe
+  # to do so. See comment at configure_static_core_lib for more details.
+  # There are downsides to not hiding symbols that we have to live with,
+  # including pushing our many global symbols into the app namespace. We have
+  # renamed some of the ones that are more likely to collide in #3348.
+  configure_static_core_lib(dynamorio_static OFF)
+  if (LINUX AND READELF_EXECUTABLE)
+    # We already located readelf above for the shared lib.
+    # We also already created a loc.cmake file in configure_static_core_lib.
+    set(locvar_name dynamorio_static_loc)
+    add_custom_command(TARGET dynamorio_static
+      POST_BUILD
+      COMMAND ${CMAKE_COMMAND}
+      ARGS -D lib_fileloc=${CMAKE_CURRENT_BINARY_DIR}/${locvar_name}
+           -D READELF_EXECUTABLE=${READELF_EXECUTABLE}
+           -D CMAKE_SYSTEM_PROCESSOR=${CMAKE_SYSTEM_PROCESSOR}
+           -D X86=${X86}
+           -D X64=${X64}
+           -D DEBUG=${DEBUG}
+           -P ${CMAKE_CURRENT_SOURCE_DIR}/CMake_symbol_check.cmake
+      VERBATIM
+      )
   endif ()
-
 endif (NOT APPLE)
 
 ###########################################################################
@@ -900,6 +926,8 @@ set_target_properties(${PRELOAD_NAME} PROPERTIES
 add_gen_events_deps(${PRELOAD_NAME})
 if (AARCH64)
   add_dependencies(${PRELOAD_NAME} gen_aarch64_codec)
+elseif (RISCV64)
+  add_dependencies(${PRELOAD_NAME} gen_riscv64_codec)
 endif()
 
 if ("${CMAKE_GENERATOR}" MATCHES "Visual Studio")
@@ -915,7 +943,7 @@ copy_target_to_device(${PRELOAD_NAME} "${location_suffix}")
 # drpreinject.dll doesn't link in instr_shared.c so we can't include our inline
 # functions.
 set_target_properties(${PRELOAD_NAME} PROPERTIES
-  COMPILE_FLAGS "-DNOT_DYNAMORIO_CORE_PROPER -DRC_IS_PRELOAD -DDR_NO_FAST_IR")
+  COMPILE_DEFINITIONS "NOT_DYNAMORIO_CORE_PROPER;RC_IS_PRELOAD;DR_NO_FAST_IR")
 
 if (UNIX)
   # FIXME case 69/1891: -z initfirst = initialize first at runtime (before libc)
@@ -939,7 +967,7 @@ if (UNIX)
       ARGS -D lib_fileloc=${CMAKE_CURRENT_BINARY_DIR}/${locvar_name}
            -D check_textrel=ON
            -D check_deps=OFF
-           -D check_libc=ON
+           -D check_libc=${BUILD_PACKAGE}
            -D check_interp=ON
            -D READELF_EXECUTABLE=${READELF_EXECUTABLE}
            -P ${CMAKE_CURRENT_SOURCE_DIR}/CMake_readelf.cmake
@@ -961,14 +989,14 @@ endif (UNIX)
 # Decoding library
 
 # static decoding library
-add_library(drdecode
+add_library(drdecode STATIC
   ${DECODER_SRCS}
   ir/decodelib.c
   string.c
   io.c
   )
 set_target_properties(drdecode PROPERTIES
-  COMPILE_FLAGS "-DNOT_DYNAMORIO_CORE_PROPER -DSTANDALONE_DECODER")
+  COMPILE_DEFINITIONS "NOT_DYNAMORIO_CORE_PROPER;STANDALONE_DECODER")
 if (UNIX)
   append_property_string(TARGET drdecode COMPILE_FLAGS "-fPIC")
 endif (UNIX)
@@ -976,6 +1004,8 @@ endif (UNIX)
 add_gen_events_deps(drdecode)
 if (AARCH64)
   add_dependencies(drdecode gen_aarch64_codec)
+elseif (RISCV64)
+  add_dependencies(drdecode gen_riscv64_codec)
 endif()
 target_link_libraries(drdecode drlibc)
 
@@ -1003,9 +1033,8 @@ if (UNIX)
   target_link_libraries(drinjectlib drmemfuncs)
 endif ()
 set_target_properties(drinjectlib PROPERTIES
-  # COMPILE_DEFINITONS isn't working for me: cmake bug?
   # Set define parameters for resources.rc
-  COMPILE_FLAGS "-DNOT_DYNAMORIO_CORE_PROPER -DRC_IS_DRINJECTLIB")
+  COMPILE_DEFINITIONS "NOT_DYNAMORIO_CORE_PROPER;RC_IS_DRINJECTLIB")
 if (WIN32)
   set(drinjectlib_link_flags
     # not bothering with map files
@@ -1050,7 +1079,12 @@ endif ()
 ###########################################################################
 # Unit tests
 
-if (BUILD_TESTS)
+# We can't run core unit tests when the target is not the host, just like we can't
+# run DR itself managing an app: DR is a same-arch system for code cache operation
+# and only supports target!=host for decoding and drmemtrace analysis (i#1684).
+if (BUILD_TESTS AND
+    ((CMAKE_CROSSCOMPILING AND DEFINED CMAKE_FIND_ROOT_PATH) OR
+      (NOT DR_HOST_NOT_TARGET)))
   add_executable(unit_tests unit_tests.c
     # These unit tests have been moved from the x86_code module into a new x86_code
     # test module that gets its own clang/gcc options for testing (-mno-vzeroupper).
@@ -1097,7 +1131,8 @@ if (BUILD_TESTS)
     endif ()
   endif ()
   set_target_properties(unit_tests PROPERTIES
-    COMPILE_FLAGS "-DRC_IS_TEST -DSTANDALONE_UNIT_TEST ${unit_tests_extra_flags}"
+    COMPILE_DEFINITIONS "RC_IS_TEST;STANDALONE_UNIT_TEST"
+    COMPILE_FLAGS "${unit_tests_extra_flags}"
     RUNTIME_OUTPUT_DIRECTORY${location_suffix} "${EXECUTABLE_OUTPUT_DIRECTORY}")
   if (UNIX)
     if (NOT APPLE)
@@ -1123,8 +1158,11 @@ if (BUILD_TESTS)
   if (APPLE)
     set_tests_properties(unit_tests PROPERTIES LABELS OSX)
   endif ()
+  if (AARCHXX)
+    set_tests_properties(unit_tests PROPERTIES LABELS RUNS_ON_QEMU)
+  endif ()
   copy_target_to_device(unit_tests "${location_suffix}")
-endif (BUILD_TESTS)
+endif ()
 
 ###########################################################################
 
@@ -1152,6 +1190,36 @@ DR_export_target(dynamorio)
 if (NOT APPLE)
   install_exported_target(dynamorio_static ${INSTALL_LIB})
   DR_export_target(dynamorio_static)
+endif ()
+
+DR_export_header(${CMAKE_CURRENT_SOURCE_DIR}/lib/globals_api.h dr_defines.h)
+DR_export_header(${CMAKE_CURRENT_SOURCE_DIR}/lib/mcxtx_api.h dr_mcxtx.h)
+DR_export_header(${CMAKE_CURRENT_SOURCE_DIR}/lib/dr_events.h dr_events.h)
+DR_export_header(${CMAKE_CURRENT_SOURCE_DIR}/ir/encode_api.h dr_ir_encode.h)
+DR_export_header(${CMAKE_CURRENT_SOURCE_DIR}/ir/decode_api.h dr_ir_decode.h)
+DR_export_header(${CMAKE_CURRENT_SOURCE_DIR}/ir/disassemble_api.h dr_ir_disassemble.h)
+DR_export_header(${CMAKE_CURRENT_SOURCE_DIR}/ir/opnd_api.h dr_ir_opnd.h)
+DR_export_header(${CMAKE_CURRENT_SOURCE_DIR}/ir/instr_api.h dr_ir_instr.h)
+DR_export_header(${CMAKE_CURRENT_SOURCE_DIR}/ir/instr_inline_api.h dr_ir_instr_inline.h)
+DR_export_header(${CMAKE_CURRENT_SOURCE_DIR}/ir/instrlist_api.h dr_ir_instrlist.h)
+DR_export_header(${CMAKE_CURRENT_SOURCE_DIR}/ir/dr_ir_opcodes.h dr_ir_opcodes.h)
+DR_export_header(${CMAKE_CURRENT_SOURCE_DIR}/ir/x86/opcode_api.h dr_ir_opcodes_x86.h)
+DR_export_header(${CMAKE_CURRENT_SOURCE_DIR}/ir/arm/opcode_api.h dr_ir_opcodes_arm.h)
+DR_export_header(${CMAKE_CURRENT_SOURCE_DIR}/ir/instr_create_shared_api.h dr_ir_macros.h)
+DR_export_header(${CMAKE_CURRENT_SOURCE_DIR}/ir/x86/instr_create_api.h dr_ir_macros_x86.h)
+DR_export_header(${CMAKE_CURRENT_SOURCE_DIR}/ir/arm/instr_create_api.h dr_ir_macros_arm.h)
+DR_export_header(${CMAKE_CURRENT_SOURCE_DIR}/ir/aarch64/instr_create_api.h
+  dr_ir_macros_aarch64.h)
+DR_export_header(${CMAKE_CURRENT_SOURCE_DIR}/lib/dr_ir_utils.h dr_ir_utils.h)
+DR_export_header(${CMAKE_CURRENT_SOURCE_DIR}/lib/dr_tools.h dr_tools.h)
+DR_export_header(${CMAKE_CURRENT_SOURCE_DIR}/annotations_api.h dr_annotation.h)
+DR_export_header(${CMAKE_CURRENT_SOURCE_DIR}/lib/dr_inject.h dr_inject.h)
+DR_export_header(${CMAKE_CURRENT_SOURCE_DIR}/module_api.h dr_modules.h)
+DR_export_header(${CMAKE_CURRENT_SOURCE_DIR}/os_api.h dr_os_utils.h)
+DR_export_header(${CMAKE_CURRENT_SOURCE_DIR}/fragment_api.h dr_tracedump.h)
+DR_export_header(${CMAKE_CURRENT_SOURCE_DIR}/arch/proc_api.h dr_proc.h)
+if (HOT_PATCHING_INTERFACE)
+  DR_export_header(${CMAKE_CURRENT_SOURCE_DIR}/lib/dr_probe.h dr_probe.h)
 endif ()
 
 install_exported_target(drinjectlib ${INSTALL_LIB_BASE})

@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2011-2020 Google, Inc.  All rights reserved.
+ * Copyright (c) 2011-2022 Google, Inc.  All rights reserved.
  * Copyright (c) 2001-2010 VMware, Inc.  All rights reserved.
  * **********************************************************/
 
@@ -467,10 +467,6 @@ size_ok_varsz(decode_info_t *di /*prefixes field is IN/OUT; x86_mode is IN*/,
             return true;
         }
         return false;
-    case OPSZ_8_of_16_vex32:
-        if (size_template == OPSZ_8 || size_template == OPSZ_32)
-            return true; /* will take prefix or no prefix */
-        return false;
     case OPSZ_4_rex8_of_16:
         if (size_template == OPSZ_4 || size_template == OPSZ_8)
             return true; /* will take prefix or no prefix */
@@ -580,7 +576,7 @@ collapse_subreg_size(opnd_size_t sz)
     case OPSZ_4_of_32_evex64: return OPSZ_4;
     case OPSZ_8_of_32_evex64: return OPSZ_8;
     }
-    /* OPSZ_8_of_16_vex32, OPSZ_4_rex8_of_16, and OPSZ_12_rex8_of_16,
+    /* OPSZ_4_rex8_of_16, and OPSZ_12_rex8_of_16,
      * OPSZ_half_16_vex32, OPSZ_quarter_16_vex32, OPSZ_eighth_16_vex32,
      * OPSZ_half_16_vex32_evex64, OPSZ_quarter_16_vex32_evex64, and
      * OPSZ_eighth_16_vex32_evex64 are kept.
@@ -716,8 +712,7 @@ size_ok(decode_info_t *di /*prefixes field is IN/OUT; x86_mode is IN*/,
                 return !TEST(prefix_data_addr, di->prefixes);
             if (size_template == OPSZ_8_rex16 || size_template == OPSZ_8_rex16_short4)
                 return !TESTANY(prefix_data_addr | PREFIX_REX_W, di->prefixes);
-            if (size_template == OPSZ_8_of_16_vex32 ||
-                size_template == OPSZ_half_16_vex32)
+            if (size_template == OPSZ_half_16_vex32)
                 return !TEST(PREFIX_VEX_L, di->prefixes);
             if (size_template == OPSZ_half_16_vex32_evex64) {
                 return !TEST(PREFIX_VEX_L, di->prefixes) &&
@@ -793,7 +788,6 @@ size_ok(decode_info_t *di /*prefixes field is IN/OUT; x86_mode is IN*/,
             if (size_template == OPSZ_32_short16)
                 return !TEST(prefix_data_addr, di->prefixes);
             if (size_template == OPSZ_16_vex32 || size_template == OPSZ_16_vex32_evex64 ||
-                size_template == OPSZ_8_of_16_vex32 ||
                 size_template == OPSZ_vex32_evex64) {
                 if (!TEST(di->prefixes, PREFIX_EVEX_LL))
                     di->prefixes |= PREFIX_VEX_L;
@@ -873,7 +867,6 @@ size_ok(decode_info_t *di /*prefixes field is IN/OUT; x86_mode is IN*/,
         case OPSZ_12_rex8_of_16:
         case OPSZ_14_of_16:
         case OPSZ_15_of_16:
-        case OPSZ_8_of_16_vex32:
         case OPSZ_16_of_32:
         case OPSZ_half_16_vex32:
         case OPSZ_half_16_vex32_evex64:
@@ -974,10 +967,10 @@ reg_size_ok(decode_info_t *di /*prefixes field is IN/OUT; x86_mode is IN*/, reg_
              optype == TYPE_H || optype == TYPE_L))
             return (reg >= REG_START_XMM && reg <= REG_STOP_XMM);
     }
-    if (opsize == OPSZ_8_of_16_vex32 || opsize == OPSZ_half_16_vex32 ||
-        opsize == OPSZ_quarter_16_vex32 || opsize == OPSZ_eighth_16_vex32 ||
-        opsize == OPSZ_half_16_vex32_evex64 || opsize == OPSZ_quarter_16_vex32_evex64 ||
-        opsize == OPSZ_eighth_16_vex32_evex64 || optype == TYPE_VSIB) {
+    if (opsize == OPSZ_half_16_vex32 || opsize == OPSZ_quarter_16_vex32 ||
+        opsize == OPSZ_eighth_16_vex32 || opsize == OPSZ_half_16_vex32_evex64 ||
+        opsize == OPSZ_quarter_16_vex32_evex64 || opsize == OPSZ_eighth_16_vex32_evex64 ||
+        optype == TYPE_VSIB) {
         if (reg >= REG_START_XMM && reg <= REG_STOP_XMM)
             return !TEST(PREFIX_VEX_L, di->prefixes);
         if (reg >= REG_START_YMM && reg <= REG_STOP_YMM) {
@@ -1259,8 +1252,8 @@ opnd_type_ok(decode_info_t *di /*prefixes field is IN/OUT; x86_mode is IN*/, opn
                    * to low 2GB (w/o top bit set, else sign-extended).
                    */
                   (X64_MODE(di) &&
-                   ((ptr_uint_t)di->final_pc) + (ptr_uint_t)opnd_get_instr(opnd)->note -
-                           di->cur_note <
+                   ((ptr_uint_t)di->final_pc) + (ptr_uint_t)opnd_get_instr(opnd)->offset -
+                           di->cur_offs <
                        INT_MAX &&
                    size_ok(di, OPSZ_4, opsize, false)))) ||
                 (opnd_is_immed_int(opnd) &&
@@ -1271,7 +1264,7 @@ opnd_type_ok(decode_info_t *di /*prefixes field is IN/OUT; x86_mode is IN*/, opn
          * will get the Ib version: do we want to match c1?  What if they really want
          * an immed byte in the encoding?  OTOH, we do match constant registers
          * automatically w/ no control from the user.
-         * Currently, we document in instr_create.h that the user must
+         * Currently, we document in instr_create_api.h that the user must
          * specify OPSZ_0 in order to get c1.
          */
         return (opnd_is_immed_int(opnd) && opnd_get_immed_int(opnd) == 1 &&
@@ -1391,7 +1384,7 @@ opnd_type_ok(decode_info_t *di /*prefixes field is IN/OUT; x86_mode is IN*/, opn
     case TYPE_INDIR_VAR_REG_SIZEx3x5: /* TYPE_INDIR_VAR_REG + scale */
         if (opnd_is_base_disp(opnd)) {
             reg_id_t base = opnd_get_base(opnd);
-            /* NOTE - size needs to match decode_operand() and instr_create.h. */
+            /* NOTE - size needs to match decode_operand() and instr_create_api.h. */
             bool sz_ok = size_ok(di, opnd_get_size(opnd), indir_var_reg_size(di, optype),
                                  false /*!addr*/);
             /* must be after size_ok potentially sets di flags */
@@ -2042,7 +2035,7 @@ static byte *
 get_mem_instr_addr(decode_info_t *di, opnd_t opnd)
 {
     CLIENT_ASSERT(opnd_is_mem_instr(opnd), "internal encode error");
-    return di->final_pc + ((ptr_int_t)opnd_get_instr(opnd)->note - di->cur_note) +
+    return di->final_pc + ((ptr_int_t)opnd_get_instr(opnd)->offset - di->cur_offs) +
         opnd_get_mem_instr_disp(opnd);
 }
 
@@ -2179,7 +2172,7 @@ encode_operand(decode_info_t *di, int optype, opnd_size_t opsize, opnd_t opnd)
              * This only works if the instr has no other immeds!
              */
             instr_t *target_instr = opnd_get_instr(opnd);
-            ptr_uint_t target = (ptr_uint_t)target_instr->note - di->cur_note;
+            ptr_uint_t target = (ptr_uint_t)target_instr->offset - di->cur_offs;
             /* We don't know the encode pc yet, so we put it in as pc-relative and
              * fix it up later.
              * The size was already checked, so just use the template size.
@@ -2208,12 +2201,12 @@ encode_operand(decode_info_t *di, int optype, opnd_size_t opsize, opnd_t opnd)
          * Here we simply set the immed to the absolute pc target.
          */
         if (opnd_is_near_instr(opnd)) {
-            /* assume the note fields have been set with relative offsets
-             * from some start pc, and that our caller put our note in
-             * di->cur_note
+            /* Assume the offset fields have been set with relative offsets
+             * from some start pc, and that our caller put our offset in
+             * di->cur_offs.
              */
             instr_t *target_instr = opnd_get_instr(opnd);
-            target = (ptr_uint_t)target_instr->note - di->cur_note;
+            target = (ptr_uint_t)target_instr->offset - di->cur_offs;
             /* target is now a pc-relative target, so we can encode as is */
             set_immed(di, target, opsize);
             /* this immed is pc-relative except it needs to have the
@@ -2247,10 +2240,10 @@ encode_operand(decode_info_t *di, int optype, opnd_size_t opsize, opnd_t opnd)
         CLIENT_ASSERT(di->size_immed == OPSZ_NA && di->size_immed2 == OPSZ_NA,
                       "encode error: A operand size mismatch");
         if (opnd_is_far_instr(opnd)) {
-            /* caller set di.cur_note w/ the pc where we'll be encoding this */
-            ptr_int_t source = (ptr_uint_t)di->cur_note;
+            /* caller set di.cur_offs w/ the pc where we'll be encoding this */
+            ptr_int_t source = (ptr_uint_t)di->cur_offs;
             instr_t *target_instr = opnd_get_instr(opnd);
-            ptr_int_t dest = (ptr_uint_t)target_instr->note;
+            ptr_int_t dest = (ptr_uint_t)target_instr->offset;
             ptr_uint_t encode_pc = (ptr_uint_t)di->final_pc;
             /* A label shouldn't be very far away and thus we should not overflow
              * (unless client asked to encode at very high address or sthg,
@@ -2472,6 +2465,9 @@ encode_evex_prefixes(byte *field_ptr, decode_info_t *di, const instr_info_t *inf
     /* XXX i#1312: what about evex.L'? */
     if (TEST(OPCODE_SUFFIX, info->opcode))
         val |= 0x20;
+    /* we override OPCODE_TWOBYTES for evex to mean "requires evex.b" */
+    if (TEST(OPCODE_TWOBYTES, info->opcode))
+        val |= 0x10;
     val |= di->evex_aaa;
     *field_ptr = val;
     field_ptr++;
@@ -2589,7 +2585,8 @@ encode_cti(instr_t *instr, byte *copy_pc, byte *final_pc,
         }
         /* assumption: no 16-bit targets */
         CLIENT_ASSERT(
-            !TESTANY(~(PREFIX_JCC_TAKEN | PREFIX_JCC_NOT_TAKEN), instr->prefixes),
+            !TESTANY(~(PREFIX_JCC_TAKEN | PREFIX_JCC_NOT_TAKEN | PREFIX_PRED_MASK),
+                     instr->prefixes),
             "encode cti error: non-branch-hint prefixes not supported");
     }
 
@@ -2612,7 +2609,8 @@ encode_cti(instr_t *instr, byte *copy_pc, byte *final_pc,
         target = (ptr_uint_t)opnd_get_pc(opnd);
     } else if (opnd_is_near_instr(opnd)) {
         instr_t *in = opnd_get_instr(opnd);
-        target = (ptr_uint_t)final_pc + ((ptr_uint_t)in->note - (ptr_uint_t)instr->note);
+        target =
+            (ptr_uint_t)final_pc + ((ptr_uint_t)in->offset - (ptr_uint_t)instr->offset);
     } else {
         target = 0; /* avoid compiler warning */
         CLIENT_ASSERT(false, "encode_cti error: opnd must be near pc or near instr");
@@ -2631,7 +2629,7 @@ encode_cti(instr_t *instr, byte *copy_pc, byte *final_pc,
                           "encode_cti error: target beyond 8-bit reach");
             return NULL;
         }
-        *((char *)pc) = (char)offset;
+        *((sbyte *)pc) = (sbyte)offset;
         pc++;
     } else {
         /* 32-bit offset */
@@ -2720,7 +2718,7 @@ copy_and_re_relativize_raw_instr(dcontext_t *dcontext, instr_t *instr, byte *dst
         /* We only support non-4-byte rip-rel disps for 1-byte instr-final (jcc_short). */
         if (rip_rel_pos + 1 == instr->length) {
             ASSERT(CHECK_TRUNCATE_TYPE_sbyte(new_offs));
-            *((char *)dst_pc) = (char)new_offs;
+            *((sbyte *)dst_pc) = (sbyte)new_offs;
         } else {
             ASSERT(rip_rel_pos + 4 <= instr->length);
             ASSERT(CHECK_TRUNCATE_TYPE_int(new_offs));
@@ -2739,7 +2737,7 @@ copy_and_re_relativize_raw_instr(dcontext_t *dcontext, instr_t *instr, byte *dst
 /* Encodes instruction instr.  The parameter copy_pc points
  * to the address of this instruction in the fragment cache.
  * Checks for and fixes pc-relative instructions.
- * N.B: if instr is a jump with an instr_t target, the caller MUST set the note
+ * N.B: if instr is a jump with an instr_t target, the caller MUST set the offset
  * field in the target instr_t prior to calling instr_encode on the jump instr.
  *
  * Returns the pc after the encoded instr, or NULL if the instruction cannot be
@@ -2782,7 +2780,8 @@ instr_encode_arch(dcontext_t *dcontext, instr_t *instr, byte *copy_pc, byte *fin
           reg_is_pointer_sized(opnd_get_reg(instr_get_src(instr, 1))))) ||
         /* no indirect or far */
         opc == OP_jmp_short || opc == OP_jmp || opc == OP_call) {
-        if (!TESTANY(~(PREFIX_JCC_TAKEN | PREFIX_JCC_NOT_TAKEN), instr->prefixes)) {
+        if (!TESTANY(~(PREFIX_JCC_TAKEN | PREFIX_JCC_NOT_TAKEN | PREFIX_PRED_MASK),
+                     instr->prefixes)) {
             /* encode_cti cannot handle funny prefixes or indirect branches or rets */
             return encode_cti(instr, copy_pc, final_pc,
                               check_reachable _IF_DEBUG(assert_reachable));
@@ -2835,7 +2834,7 @@ instr_encode_arch(dcontext_t *dcontext, instr_t *instr, byte *copy_pc, byte *fin
             info->opcode);
         info = get_next_instr_info(info);
         /* stop when hit end of list or when hit extra operand tables (OP_CONTD) */
-        if (info == NULL || info->type == OP_CONTD) {
+        if (info == NULL) {
             DOLOG(1, LOG_EMIT, {
                 LOG(THREAD, LOG_EMIT, 1, "ERROR: Could not find encoding for: ");
                 instr_disassemble(dcontext, instr, THREAD);
@@ -2860,15 +2859,22 @@ instr_encode_arch(dcontext_t *dcontext, instr_t *instr, byte *copy_pc, byte *fin
     di.seg_override = REG_NULL; /* operands will fill in */
 
     /* instr_t* operand support */
-    di.cur_note = (ptr_int_t)instr->note;
+    di.cur_offs = (ptr_int_t)instr->offset;
 
     di.vex_encoded = TEST(REQUIRES_VEX, info->flags);
     di.evex_encoded = TEST(REQUIRES_EVEX, info->flags);
     CLIENT_ASSERT(!di.vex_encoded || !di.evex_encoded,
                   "instr_encode error: flags can't be both vex and evex.");
 
-    if (di.evex_encoded)
+    if (di.evex_encoded) {
+        /* OPCODE_TWOBYTES is repurposed for EVEX encodings (which are
+         * always at least two bytes) to indicate EVEX.b=1. We need to
+         * do this now to make sure we calculate the correct tuple size.
+         */
+        if (TEST(OPCODE_TWOBYTES, info->opcode))
+            di.prefixes |= PREFIX_EVEX_b;
         decode_get_tuple_type_input_size(info, &di);
+    }
     if (di.vex_encoded || di.evex_encoded) {
         if (TEST(OPCODE_MODRM, info->opcode))
             di.prefixes |= PREFIX_REX_W;
@@ -3020,7 +3026,8 @@ instr_encode_arch(dcontext_t *dcontext, instr_t *instr, byte *copy_pc, byte *fin
     }
 
     /* second opcode byte, if there is one */
-    if (TEST(OPCODE_TWOBYTES, info->opcode) || TEST(OPCODE_THREEBYTES, info->opcode)) {
+    if (TEST(REQUIRES_EVEX, info->flags) || TEST(OPCODE_TWOBYTES, info->opcode) ||
+        TEST(OPCODE_THREEBYTES, info->opcode)) {
         *field_ptr = (byte)((info->opcode & 0x0000ff00) >> 8);
         field_ptr++;
     }

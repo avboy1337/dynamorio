@@ -1,5 +1,5 @@
 # **********************************************************
-# Copyright (c) 2018-2020 Google, Inc.    All rights reserved.
+# Copyright (c) 2018-2022 Google, Inc.    All rights reserved.
 # Copyright (c) 2009-2010 VMware, Inc.    All rights reserved.
 # **********************************************************
 
@@ -40,7 +40,7 @@
 # * toolbindir
 # * out = file where output of background process will be sent
 # * pidfile = file where the pid of the background process will be written
-# * nudge = arguments to nudgeunix or drconfig
+# * nudge = arguments to drnudgeunix or drconfig
 # * clear = dir to clear ahead of time
 
 # intra-arg space=@@ and inter-arg space=@
@@ -80,7 +80,7 @@ if (UNIX)
   if (NOT SLEEP)
     message(FATAL_ERROR "cannot find 'sleep'")
   endif ()
-  set(nudge_cmd nudgeunix)
+  set(nudge_cmd drnudgeunix)
 else (UNIX)
   # We use "ping" on Windows to "sleep" :)
   find_program(PING "ping")
@@ -103,7 +103,7 @@ function (do_sleep ms)
   else ()
     # XXX: ping's units are secs.  For now we always do 1 sec.
     # We could try to use cygwin bash or perl.
-    execute_process(COMMAND ${PING} 127.0.0.1 -n 1 OUTPUT_QUIET)
+    execute_process(COMMAND ${PING} 127.0.0.1 -n 2 OUTPUT_QUIET)
   endif ()
 endfunction (do_sleep)
 
@@ -153,6 +153,16 @@ if (pidfile)
     endif ()
   endwhile ()
   file(READ "${pidfile}" pid)
+  set(iters 0)
+  while ("${pid}" STREQUAL "")
+    do_sleep(0.1)
+    math(EXPR iters "${iters}+1")
+    if (${iters} GREATER ${MAX_ITERS})
+      kill_background_process(ON)
+      message(FATAL_ERROR "Timed out waiting for ${pidfile} content")
+    endif ()
+    file(READ "${pidfile}" pid)
+  endwhile ()
   string(REGEX REPLACE "\n" "" pid ${pid})
 endif ()
 
@@ -185,8 +195,25 @@ if ("${nudge}" MATCHES "<use-persisted>")
   if (NOT "${maps}" MATCHES "\\.dpc\n")
     set(fail_msg "no .dpc files found in ${maps}: not using pcaches!")
   endif ()
+elseif ("${nudge}" MATCHES "<attach>")
+  set(nudge_cmd run_in_bg)
+  string(REGEX REPLACE "<attach>"
+    "${toolbindir}/drrun@-attach@${pid}@-takeover_sleep@-takeovers@1000"
+    nudge "${nudge}")
+  string(REGEX REPLACE "@" ";" nudge "${nudge}")
+  execute_process(COMMAND "${toolbindir}/${nudge_cmd}" ${nudge}
+   RESULT_VARIABLE nudge_result
+   ERROR_VARIABLE nudge_err
+   OUTPUT_VARIABLE nudge_out
+   )
+  # combine out and err
+  set(nudge_err "${nudge_out}${nudge_err}")
+  if (nudge_result)
+    kill_background_process(ON)
+    message(FATAL_ERROR "*** ${nudge_cmd} failed (${nudge_result}): ${nudge_err}***\n")
+  endif (nudge_result)
 else ()
-  # nudgeunix and drconfig have different syntax:
+  # drnudgeunix and drconfig have different syntax:
   if (WIN32)
     # XXX i#120: expand beyond -client.
     string(REGEX REPLACE "-client" "-nudge_timeout;30000;-nudge_pid;${pid}"
@@ -221,6 +248,29 @@ if ("${orig_nudge}" MATCHES "-client")
     if (${iters} GREATER ${MAX_ITERS})
       kill_background_process(ON)
       message(FATAL_ERROR "Timed out waiting for more output")
+    endif ()
+  endwhile()
+elseif ("${orig_nudge}" MATCHES "<attach>")
+  # wait until attached
+  set(iters 0)
+  while (NOT "${output}" MATCHES "attach\n")
+    do_sleep(0.1)
+    file(READ "${out}" output)
+    math(EXPR iters "${iters}+1")
+    if (${iters} GREATER ${MAX_ITERS})
+      kill_background_process(ON)
+      message(FATAL_ERROR "Timed out waiting for attach")
+    endif ()
+  endwhile()
+  # wait until thread init
+  set(iters 0)
+  while (NOT "${output}" MATCHES "thread init\n")
+    do_sleep(0.1)
+    file(READ "${out}" output)
+    math(EXPR iters "${iters}+1")
+    if (${iters} GREATER ${MAX_ITERS})
+      kill_background_process(ON)
+      message(FATAL_ERROR "Timed out waiting for attach")
     endif ()
   endwhile()
 else ()

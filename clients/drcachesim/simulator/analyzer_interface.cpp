@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2017-2020 Google, Inc.  All rights reserved.
+ * Copyright (c) 2017-2023 Google, Inc.  All rights reserved.
  * **********************************************************/
 
 /*
@@ -47,7 +47,9 @@
 #include "../tools/opcode_mix_create.h"
 #include "../tools/view_create.h"
 #include "../tools/func_view_create.h"
+#include "../tools/invariant_checker_create.h"
 #include "../tracer/raw2trace.h"
+#include "../tracer/raw2trace_directory.h"
 #include <fstream>
 
 /* Get the path to an auxiliary file by examining
@@ -74,6 +76,11 @@ get_aux_file_path(std::string option_val, std::string default_filename)
             if (sep_index != std::string::npos)
                 trace_dir = std::string(op_infile.get_value(), 0, sep_index);
         }
+        if (raw2trace_directory_t::is_window_subdir(trace_dir)) {
+            // If we're operating on a specific window, point at the parent for the
+            // modfile.
+            trace_dir += std::string(DIRSEP) + "..";
+        }
         file_path = trace_dir + std::string(DIRSEP) + default_filename;
         /* Support the aux file in either raw/ or trace/. */
         if (!std::ifstream(file_path.c_str()).good()) {
@@ -85,6 +92,8 @@ get_aux_file_path(std::string option_val, std::string default_filename)
                 std::string(DIRSEP) + default_filename;
         }
     }
+    if (!std::ifstream(file_path.c_str()).good())
+        return "";
     return file_path;
 }
 
@@ -119,6 +128,7 @@ get_cache_simulator_knobs()
     knobs->sim_refs = op_sim_refs.get_value();
     knobs->verbose = op_verbose.get_value();
     knobs->cpu_scheduling = op_cpu_scheduling.get_value();
+    knobs->use_physical = op_use_physical.get_value();
     return knobs;
 }
 
@@ -155,6 +165,7 @@ drmemtrace_analysis_tool_create()
         knobs.sim_refs = op_sim_refs.get_value();
         knobs.verbose = op_verbose.get_value();
         knobs.cpu_scheduling = op_cpu_scheduling.get_value();
+        knobs.use_physical = op_use_physical.get_value();
         return tlb_simulator_create(knobs);
     } else if (op_simulator_type.get_value() == HISTOGRAM) {
         return histogram_tool_create(op_line_size.get_value(), op_report_top.get_value(),
@@ -166,7 +177,13 @@ drmemtrace_analysis_tool_create()
         knobs.distance_threshold = op_reuse_distance_threshold.get_value();
         knobs.report_top = op_report_top.get_value();
         knobs.skip_list_distance = op_reuse_skip_dist.get_value();
+        knobs.distance_limit = op_reuse_distance_limit.get_value();
         knobs.verify_skip = op_reuse_verify_skip.get_value();
+        knobs.histogram_bin_multiplier = op_reuse_histogram_bin_multiplier.get_value();
+        if (knobs.histogram_bin_multiplier < 1.0) {
+            ERRMSG("Usage error: reuse_histogram_bin_multiplier must be >= 1.0\n");
+            return nullptr;
+        }
         knobs.verbose = op_verbose.get_value();
         return reuse_distance_tool_create(knobs);
     } else if (op_simulator_type.get_value() == REUSE_TIME) {
@@ -175,20 +192,20 @@ drmemtrace_analysis_tool_create()
         return basic_counts_tool_create(op_verbose.get_value());
     } else if (op_simulator_type.get_value() == OPCODE_MIX) {
         std::string module_file_path = get_module_file_path();
-        if (module_file_path.empty()) {
-            ERRMSG("Usage error: the opcode_mix tool requires offline traces.\n");
+        if (module_file_path.empty() && op_indir.get_value().empty() &&
+            op_infile.get_value().empty() && !op_instr_encodings.get_value()) {
+            ERRMSG("Usage error: the opcode_mix tool requires offline traces, or "
+                   "-instr_encodings for online traces.\n");
             return nullptr;
         }
-        return opcode_mix_tool_create(module_file_path, op_verbose.get_value());
+        return opcode_mix_tool_create(module_file_path, op_verbose.get_value(),
+                                      op_alt_module_dir.get_value());
     } else if (op_simulator_type.get_value() == VIEW) {
         std::string module_file_path = get_module_file_path();
-        if (module_file_path.empty()) {
-            ERRMSG("Usage error: the view tool requires offline traces.\n");
-            return nullptr;
-        }
+        // The module file is optional so we don't check for emptiness.
         return view_tool_create(module_file_path, op_skip_refs.get_value(),
                                 op_sim_refs.get_value(), op_view_syntax.get_value(),
-                                op_verbose.get_value());
+                                op_verbose.get_value(), op_alt_module_dir.get_value());
     } else if (op_simulator_type.get_value() == FUNC_VIEW) {
         std::string funclist_file_path = get_aux_file_path(
             op_funclist_file.get_value(), DRMEMTRACE_FUNCTION_LIST_FILENAME);
@@ -198,6 +215,8 @@ drmemtrace_analysis_tool_create()
         }
         return func_view_tool_create(funclist_file_path, op_show_func_trace.get_value(),
                                      op_verbose.get_value());
+    } else if (op_simulator_type.get_value() == INVARIANT_CHECKER) {
+        return invariant_checker_create(op_offline.get_value(), op_verbose.get_value());
     } else {
         ERRMSG("Usage error: unsupported analyzer type. "
                "Please choose " CPU_CACHE ", " MISS_ANALYZER ", " TLB ", " HISTOGRAM

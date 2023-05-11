@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2011-2019 Google, Inc.  All rights reserved.
+ * Copyright (c) 2011-2022 Google, Inc.  All rights reserved.
  * Copyright (c) 2000-2010 VMware, Inc.  All rights reserved.
  * **********************************************************/
 
@@ -40,6 +40,19 @@
 #ifndef _DR_LIBC_H_
 #define _DR_LIBC_H_ 1
 
+#ifdef UNIX
+/* _LARGEFILE64_SOURCE should make libc struct match kernel. */
+#    ifndef _LARGEFILE64_SOURCE
+#        define _LARGEFILE64_SOURCE
+#    endif
+#    include <sys/types.h>
+#    include <sys/stat.h>
+#endif
+
+#if defined(MACOS) && defined(AARCH64)
+struct stat64 __DARWIN_STRUCT_STAT64;
+#endif
+
 /* If the caller is using the DR API they'll have our types that way; else we
  * include globals_shared.h.
  */
@@ -65,6 +78,9 @@ dynamorio_syscall(uint sysnum, uint num_args, ...);
 #ifdef AARCH64
 void
 clear_icache(void *beg, void *end);
+
+bool
+get_cache_line_size(OUT size_t *dcache_line_size, OUT size_t *icache_line_size);
 #endif
 
 void
@@ -120,6 +136,34 @@ typedef struct _script_interpreter_t {
 bool
 find_script_interpreter(OUT script_interpreter_t *result, IN const char *fname,
                         ssize_t (*reader)(const char *pathname, void *buf, size_t count));
+
+ptr_int_t
+dr_stat_syscall(const char *fname, struct stat64 *st);
 #endif /* UNIX */
+
+#if defined(WINDOWS) && !defined(X64)
+/* Meant to be called at initialization time when .data is writable and races are
+ * not a concern.
+ */
+void
+d_r_set_ss_selector();
+
+typedef struct {
+    uint64 func;
+    uint64 arg1;
+    uint64 arg2;
+    uint64 arg3;
+    uint64 arg4;
+    uint64 arg5;
+    uint64 arg6;
+} invoke_func64_t;
+
+/* Switches from 32-bit mode to 64-bit mode and invokes func, passing
+ * arg1, arg2, arg3, arg4, and arg5.  Works fine when func takes fewer
+ * than 5 args as well.
+ */
+int
+switch_modes_and_call(invoke_func64_t *info);
+#endif
 
 #endif /* _DR_LIBC_H_ */

@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2011-2020 Google, Inc.  All rights reserved.
+ * Copyright (c) 2011-2022 Google, Inc.  All rights reserved.
  * Copyright (c) 2000-2010 VMware, Inc.  All rights reserved.
  * **********************************************************/
 
@@ -115,8 +115,9 @@ canonicalize_pc_target(dcontext_t *dcontext, app_pc pc)
 
 #ifdef X64
 bool
-set_x86_mode(dcontext_t *dcontext, bool x86)
+set_x86_mode(void *drcontext, bool x86)
 {
+    dcontext_t *dcontext = (dcontext_t *)drcontext;
     dr_isa_mode_t old_mode;
     if (!dr_set_isa_mode(dcontext, x86 ? DR_ISA_IA32 : DR_ISA_AMD64, &old_mode))
         return false;
@@ -124,8 +125,9 @@ set_x86_mode(dcontext_t *dcontext, bool x86)
 }
 
 bool
-get_x86_mode(dcontext_t *dcontext)
+get_x86_mode(void *drcontext)
 {
+    dcontext_t *dcontext = (dcontext_t *)drcontext;
     return dr_get_isa_mode(dcontext) == DR_ISA_IA32;
 }
 #endif
@@ -251,7 +253,6 @@ resolve_variable_size(decode_info_t *di /*IN: x86_mode, prefixes*/, opnd_size_t 
     case OPSZ_12_rex8_of_16: return (TEST(PREFIX_REX_W, di->prefixes) ? OPSZ_8 : OPSZ_12);
     case OPSZ_14_of_16: return OPSZ_14;
     case OPSZ_15_of_16: return OPSZ_15;
-    case OPSZ_8_of_16_vex32: return (TEST(PREFIX_VEX_L, di->prefixes) ? OPSZ_32 : OPSZ_8);
     case OPSZ_16_of_32:
     case OPSZ_16_of_32_evex64: return OPSZ_16;
     case OPSZ_32_of_64: return OPSZ_32;
@@ -314,7 +315,6 @@ expand_subreg_size(opnd_size_t sz)
     case OPSZ_4_reg16: return OPSZ_16;
     case OPSZ_16_of_32: return OPSZ_32;
     case OPSZ_32_of_64: return OPSZ_64;
-    case OPSZ_8_of_16_vex32:
     case OPSZ_half_16_vex32: return OPSZ_16_vex32;
     case OPSZ_half_16_vex32_evex64: return OPSZ_16_vex32_evex64;
     case OPSZ_quarter_16_vex32: return OPSZ_half_16_vex32;
@@ -420,7 +420,7 @@ read_immed(byte *pc, decode_info_t *di, opnd_size_t size, ptr_int_t *result)
      */
     switch (size) {
     case OPSZ_1:
-        *result = (ptr_int_t)(char)*pc; /* sign-extend */
+        *result = (ptr_int_t)(sbyte)*pc; /* sign-extend */
         pc++;
         break;
     case OPSZ_2:
@@ -584,7 +584,7 @@ read_modrm(byte *pc, decode_info_t *di)
         } else if (di->mod == 1) {
             /* 1-byte disp */
             di->has_disp = true;
-            di->disp = (int)(char)*pc; /* sign-extend */
+            di->disp = (int)(sbyte)*pc; /* sign-extend */
             pc++;
         } else {
             di->has_disp = false;
@@ -617,7 +617,7 @@ read_modrm(byte *pc, decode_info_t *di)
         } else if (di->mod == 1) {
             /* 1-byte disp */
             di->has_disp = true;
-            di->disp = (int)(char)*pc; /* sign-extend */
+            di->disp = (int)(sbyte)*pc; /* sign-extend */
             pc++;
         } else {
             di->has_disp = false;
@@ -880,6 +880,7 @@ read_prefix_ext(const instr_info_t *info, decode_info_t *di)
     int code = (int)info->code;
     /* The order here matters: rep, then repne, then data (i#2431). */
     int idx = (di->rep_prefix ? 1 : (di->repne_prefix ? 3 : (di->data_prefix ? 2 : 0)));
+    ASSERT(!(di->rep_prefix && di->repne_prefix));
     if (di->vex_encoded)
         idx += 4;
     else if (di->evex_encoded)
@@ -1014,9 +1015,11 @@ read_instruction(byte *pc, byte *orig_pc, const instr_info_t **ret_info,
             if (info->code == PREFIX_REP) {
                 /* see if used as part of opcode before considering prefix */
                 di->rep_prefix = true;
+                di->repne_prefix = false;
             } else if (info->code == PREFIX_REPNE) {
                 /* see if used as part of opcode before considering prefix */
                 di->repne_prefix = true;
+                di->rep_prefix = false;
             } else if (REG_START_SEGMENT <= info->code &&
                        info->code <= REG_STOP_SEGMENT) {
                 CLIENT_ASSERT_TRUNCATE(di->seg_override, ushort, info->code,
@@ -1118,11 +1121,12 @@ read_instruction(byte *pc, byte *orig_pc, const instr_info_t **ret_info,
         int code = (int)info->code;
         int idx = (TEST(PREFIX_REX_W, di->prefixes) ? 1 : 0);
         info = &vex_W_extensions[code][idx];
-    } else if (info->type == EVEX_W_EXT) {
+    } else if (info->type == EVEX_Wb_EXT) {
         /* discard old info, get new one */
         int code = (int)info->code;
-        int idx = (TEST(PREFIX_REX_W, di->prefixes) ? 1 : 0);
-        info = &evex_W_extensions[code][idx];
+        int idx = (TEST(PREFIX_REX_W, di->prefixes) ? 2 : 0) +
+            (TEST(PREFIX_EVEX_b, di->prefixes) ? 1 : 0);
+        info = &evex_Wb_extensions[code][idx];
     }
 
     /* can occur AFTER above checks (EXTENSION, in particular) */
@@ -1180,11 +1184,17 @@ read_instruction(byte *pc, byte *orig_pc, const instr_info_t **ret_info,
         int code = (int)info->code;
         int idx = (TEST(PREFIX_REX_W, di->prefixes) ? 1 : 0);
         info = &vex_W_extensions[code][idx];
-    } else if (info->type == EVEX_W_EXT) {
+    } else if (info->type == EVEX_Wb_EXT) {
         /* discard old info, get new one */
         int code = (int)info->code;
-        int idx = (TEST(PREFIX_REX_W, di->prefixes) ? 1 : 0);
-        info = &evex_W_extensions[code][idx];
+        int idx = (TEST(PREFIX_REX_W, di->prefixes) ? 2 : 0) +
+            (TEST(PREFIX_EVEX_b, di->prefixes) ? 1 : 0);
+        info = &evex_Wb_extensions[code][idx];
+    }
+
+    /* This can occur after the above checks (with EVEX_Wb_EXT, in particular). */
+    if (info->type == MOD_EXT) {
+        info = &mod_extensions[info->code][(di->mod == 3) ? 1 : 0];
     }
 
     if (TEST(REQUIRES_PREFIX, info->flags)) {
@@ -1473,15 +1483,21 @@ decode_reg(decode_reg_t which_reg, decode_info_t *di, byte optype, opnd_size_t o
     case TYPE_P:
     case TYPE_Q:
     case TYPE_P_MODRM: return (REG_START_MMX + reg); /* no x64 extensions */
+    case TYPE_H:
     case TYPE_V:
     case TYPE_W:
     case TYPE_V_MODRM:
     case TYPE_VSIB: {
         reg_id_t extend_reg = extend ? reg + 8 : reg;
         extend_reg = avx512_extend ? extend_reg + 16 : extend_reg;
-        bool operand_is_zmm = TEST(PREFIX_EVEX_LL, di->prefixes) &&
-            expand_subreg_size(opsize) != OPSZ_16 &&
-            expand_subreg_size(opsize) != OPSZ_32;
+        /* Some instructions (those that support embedded rounding (er) control)
+         * repurpose PREFIX_EVEX_LL for other things and only come in a 64 byte
+         * variant.
+         */
+        bool operand_is_zmm = (TEST(PREFIX_EVEX_LL, di->prefixes) &&
+                               expand_subreg_size(opsize) != OPSZ_16 &&
+                               expand_subreg_size(opsize) != OPSZ_32) ||
+            opsize == OPSZ_64;
         /* Not only do we use this for VEX .LIG and EVEX .LIG (where raw reg is
          * either OPSZ_16 or OPSZ_16_vex32 or OPSZ_32 or OPSZ_vex32_evex64) but
          * also for VSIB which currently does not get up to OPSZ_16 so we can
@@ -1492,10 +1508,14 @@ decode_reg(decode_reg_t which_reg, decode_info_t *di, byte optype, opnd_size_t o
          * XXX i#1312: improve this code here, it is not very robust. For AVX-512, this
          * relies on the fact that cases where EVEX.LL' == 1 and register is not zmm, the
          * expand_subreg_size is OPSZ_16 or OPSZ_32. The VEX OPSZ_16 case is also fragile.
+         * As above PREFIX_EVEX_LL may be repurposed for embedded rounding control, so
+         * honor opsizes of exactly OPSZ_32.
          */
         bool operand_is_ymm = (TEST(PREFIX_EVEX_LL, di->prefixes) &&
                                expand_subreg_size(opsize) == OPSZ_32) ||
-            (TEST(PREFIX_VEX_L, di->prefixes) && expand_subreg_size(opsize) != OPSZ_16);
+            (TEST(PREFIX_VEX_L, di->prefixes) && expand_subreg_size(opsize) != OPSZ_16 &&
+             expand_subreg_size(opsize) != OPSZ_64) ||
+            opsize == OPSZ_32;
         if (operand_is_ymm && operand_is_zmm) {
             /* i#3713/i#1312: Raise an error for investigation, but don't assert b/c
              * we need to support decoding non-code for drdecode, etc.
@@ -1738,7 +1758,12 @@ decode_modrm(decode_info_t *di, byte optype, opnd_size_t opsize, opnd_t *reg_opn
         int compressed_disp_scale = 0;
         if (di->evex_encoded) {
             compressed_disp_scale = decode_get_compressed_disp_scale(di);
-            needs_full_disp = disp % compressed_disp_scale != 0;
+            if (compressed_disp_scale == -1)
+                return false;
+            if (di->mod == 1)
+                disp *= compressed_disp_scale;
+            else
+                needs_full_disp = disp % compressed_disp_scale != 0;
         }
         force_full_disp = !needs_full_disp && di->has_disp && disp >= INT8_MIN &&
             disp <= INT8_MAX && di->mod == 2;
@@ -1753,10 +1778,6 @@ decode_modrm(decode_info_t *di, byte optype, opnd_size_t opsize, opnd_t *reg_opn
              * specify a segment selector and address.  The opcode must be
              * examined to know how to interpret those 6 bytes.
              */
-            if (di->evex_encoded) {
-                if (di->mod == 1)
-                    disp *= compressed_disp_scale;
-            }
             *rm_opnd = opnd_create_base_disp_ex(base_reg, index_reg, scale, disp,
                                                 resolve_variable_size(di, opsize, false),
                                                 encode_zero_disp, force_full_disp,
@@ -2077,7 +2098,7 @@ decode_operand(decode_info_t *di, byte optype, opnd_size_t opsize, opnd_t *opnd)
                                            _IF_X64(false /*!extendable*/));
         opnd_size_t sz =
             resolve_variable_size(di, indir_var_reg_size(di, optype), false /*not reg*/);
-        /* NOTE - needs to match size in opnd_type_ok() and instr_create.h */
+        /* NOTE - needs to match size in opnd_type_ok() and instr_create_api.h */
         *opnd = opnd_create_base_disp(
             reg, REG_NULL, 0, indir_var_reg_offs_factor(optype) * opnd_size_in_bytes(sz),
             sz);
@@ -2108,23 +2129,10 @@ decode_operand(decode_info_t *di, byte optype, opnd_size_t opsize, opnd_t *opnd)
         /* As part of AVX and AVX-512, vex.vvvv selects xmm/ymm/zmm register. Note that
          * vex.vvvv and evex.vvvv are a union.
          */
-        reg_id_t reg = (~di->vex_vvvv) & 0xf; /* bit-inverted */
-        if (TEST(PREFIX_EVEX_VV, di->prefixes)) {
-            /* This assumes that the register ranges of DR_REG_XMM, DR_REG_YMM, and
-             * DR_REG_ZMM are contiguous.
-             */
-            reg += 16;
-        }
-        if (TEST(PREFIX_EVEX_LL, di->prefixes)) {
-            reg += DR_REG_START_ZMM;
-        } else if (TEST(PREFIX_VEX_L, di->prefixes) &&
-                   /* see .LIG notes above */
-                   expand_subreg_size(opsize) != OPSZ_16) {
-            reg += DR_REG_START_YMM;
-        } else {
-            reg += DR_REG_START_XMM;
-        }
-        *opnd = opnd_create_reg(reg);
+        if (di->evex_encoded)
+            *opnd = opnd_create_reg(decode_reg(DECODE_REG_EVEX, di, optype, opsize));
+        else
+            *opnd = opnd_create_reg(decode_reg(DECODE_REG_VEX, di, optype, opsize));
         opnd_set_size(opnd, resolve_variable_size(di, opsize, true /*is reg*/));
         return true;
     }
@@ -2189,9 +2197,14 @@ dr_pred_type_t
 decode_predicate_from_instr_info(uint opcode, const instr_info_t *info)
 {
     if (TESTANY(HAS_PRED_CC | HAS_PRED_COMPLEX, info->flags)) {
-        if (TEST(HAS_PRED_CC, info->flags))
-            return DR_PRED_O + instr_cmovcc_to_jcc(opcode) - OP_jo;
-        else
+        if (TEST(HAS_PRED_CC, info->flags)) {
+            if (opcode >= OP_jo && opcode <= OP_jnle)
+                return DR_PRED_O + opcode - OP_jo;
+            else if (opcode >= OP_jo_short && opcode <= OP_jnle_short)
+                return DR_PRED_O + opcode - OP_jo_short;
+            else
+                return DR_PRED_O + instr_cmovcc_to_jcc(opcode) - OP_jo;
+        } else
             return DR_PRED_COMPLEX;
     }
     return DR_PRED_NONE;
@@ -2415,9 +2428,9 @@ decode_get_tuple_type_input_size(const instr_info_t *info, decode_info_t *di)
  * than not!
  */
 byte *
-decode_eflags_usage(dcontext_t *dcontext, byte *pc, uint *usage,
-                    dr_opnd_query_flags_t flags)
+decode_eflags_usage(void *drcontext, byte *pc, uint *usage, dr_opnd_query_flags_t flags)
 {
+    dcontext_t *dcontext = (dcontext_t *)drcontext;
     const instr_info_t *info;
     decode_info_t di;
     IF_X64(di.x86_mode = get_x86_mode(dcontext));
@@ -2680,14 +2693,16 @@ decode_invalid:
 }
 
 byte *
-decode(dcontext_t *dcontext, byte *pc, instr_t *instr)
+decode(void *drcontext, byte *pc, instr_t *instr)
 {
+    dcontext_t *dcontext = (dcontext_t *)drcontext;
     return decode_common(dcontext, pc, pc, instr);
 }
 
 byte *
-decode_from_copy(dcontext_t *dcontext, byte *copy_pc, byte *orig_pc, instr_t *instr)
+decode_from_copy(void *drcontext, byte *copy_pc, byte *orig_pc, instr_t *instr)
 {
+    dcontext_t *dcontext = (dcontext_t *)drcontext;
     return decode_common(dcontext, copy_pc, orig_pc, instr);
 }
 
@@ -2739,7 +2754,7 @@ decode_debug_checks_arch(void)
 #endif
 
 #ifdef DECODE_UNIT_TEST
-#    include "instr_create.h"
+#    include "instr_create_shared.h"
 
 /* FIXME: Tried putting this inside a separate unit-decode.c file, but
  *        required creating a unit-decode_table.c file.  Since the

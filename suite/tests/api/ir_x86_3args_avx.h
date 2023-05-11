@@ -78,7 +78,7 @@ OPCODE(vpcmpistrm, vpcmpistrm, vpcmpistrm, 0, REGARG(XMM0), MEMARG(OPSZ_16),
        IMMARG(OPSZ_1))
 OPCODE(vpcmpistri, vpcmpistri, vpcmpistri, 0, REGARG(XMM0), MEMARG(OPSZ_16),
        IMMARG(OPSZ_1))
-OPCODE(vcvtps2ph_256, vcvtps2ph, vcvtps2ph, 0, MEMARG(OPSZ_32), REGARG(YMM0),
+OPCODE(vcvtps2ph_256, vcvtps2ph, vcvtps2ph, 0, MEMARG(OPSZ_16), REGARG(YMM0),
        IMMARG(OPSZ_1))
 OPCODE(vmaskmovps_ld_256, vmaskmovps, vmaskmovps, 0, REGARG(YMM0), REGARG(YMM1),
        MEMARG(OPSZ_32))
@@ -422,4 +422,12 @@ OPCODE(vfnmsub213pd_256, vfnmsub213pd, vfnmsub213pd, 0, REGARG(YMM0), REGARG(YMM
 OPCODE(vfnmsub231ps_256, vfnmsub231ps, vfnmsub231ps, 0, REGARG(YMM0), REGARG(YMM1),
        MEMARG(OPSZ_32))
 OPCODE(vfnmsub231pd_256, vfnmsub231pd, vfnmsub231pd, 0, REGARG(YMM0), REGARG(YMM1),
+       MEMARG(OPSZ_32))
+OPCODE(vpdpbusd_xhixhixhi, vpdpbusd, vpdpbusd, 0, REGARG(YMM0), REGARG(YMM1),
+       MEMARG(OPSZ_32))
+OPCODE(vpdpbusds_xhixhixhi, vpdpbusds, vpdpbusds, 0, REGARG(YMM0), REGARG(YMM1),
+       MEMARG(OPSZ_32))
+OPCODE(vpdpwssd_xhixhixhi, vpdpwssd, vpdpwssd, 0, REGARG(YMM0), REGARG(YMM1),
+       MEMARG(OPSZ_32))
+OPCODE(vpdpwssds_xhixhixhi, vpdpwssds, vpdpwssds, 0, REGARG(YMM0), REGARG(YMM1),
        MEMARG(OPSZ_32))

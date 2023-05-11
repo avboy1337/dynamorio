@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2015-2018 Google, Inc.  All rights reserved.
+ * Copyright (c) 2015-2022 Google, Inc.  All rights reserved.
  * **********************************************************/
 
 /*
@@ -66,6 +66,20 @@ struct _memref_instr_t {
     memref_tid_t tid;  /**< Thread id. */
     addr_t addr;       /**< The address of the instruction (i.e., program counter). */
     size_t size;       /**< The length of the instruction. */
+    /**
+     * The instruction's raw encoding.  This field is only valid when the the file type
+     * (see #TRACE_MARKER_TYPE_FILETYPE) has #OFFLINE_FILE_TYPE_ENCODINGS set.
+     * DynamoRIO's decode_from_copy() (or any other decoding library) can be used to
+     * decode into a higher-level instruction representation.
+     */
+    unsigned char encoding[MAX_ENCODING_LENGTH];
+    /**
+     * Indicates whether the encoding field is the first instance of its kind for this
+     * address.  This can be used to determine when to invalidate cached decoding
+     * information.  This field may be set to true on internal file divisions and
+     * not only when application code actually changed.
+     */
+    bool encoding_is_new;
 };
 
 /** A trace entry representing a software-requested explicit cache flush. */
@@ -120,7 +134,7 @@ typedef union _memref_t {
     // addr and size fields of data, instr, or flush generically if known to be one
     // of those types, due to the shared fields in our union of structs.
     struct _memref_data_t data;        /**< A data load or store. */
-    struct _memref_instr_t instr;      /**< An insruction fetch. */
+    struct _memref_instr_t instr;      /**< An instruction fetch. */
     struct _memref_flush_t flush;      /**< A software-initiated cache flush. */
     struct _memref_thread_exit_t exit; /**< A thread exit. */
     struct _memref_marker_t marker;    /**< A marker holding metadata. */

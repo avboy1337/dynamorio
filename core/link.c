@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2012-2019 Google, Inc.  All rights reserved.
+ * Copyright (c) 2012-2022 Google, Inc.  All rights reserved.
  * Copyright (c) 2000-2010 VMware, Inc.  All rights reserved.
  * **********************************************************/
 
@@ -204,10 +204,8 @@ static const linkstub_t linkstub_coarse_trace_head_exit = { LINK_FAKE, 0 };
 static const linkstub_t linkstub_hot_patch = { LINK_FAKE, 0 };
 #endif
 
-#ifdef CLIENT_INTERFACE
 /* used for dr_redirect_exection() call to transfer_to_dispatch() */
 static const linkstub_t linkstub_client = { LINK_FAKE, 0 };
-#endif
 
 /* for !DYNAMO_OPTION(indirect_stubs)
  * FIXME: these are used for shared_syscall as well, yet not marked as
@@ -421,24 +419,8 @@ use_cbr_fallthrough_short(uint flags, int direct_exits, int indirect_exits)
     ASSERT((direct_exits + indirect_exits > 0) || TEST(FRAG_COARSE_GRAIN, flags));
     if (direct_exits != 2 || indirect_exits != 0)
         return false;
-#ifdef CLIENT_INTERFACE
     /* cannot handle instrs inserted between cbr and fall-through jmp */
     return false;
-#else
-    /* we can only use the cbr_fallthrough_linkstub_t if these conditions
-     * apply:
-     *   1) separate stubs will not be individually freed -- we could
-     *      have a fancy scheme that frees both at once, but we simply
-     *      disallow the struct if any freeing will occur.
-     *   2) the fallthrough target is close to the start pc
-     *   3) the fallthrough exit immediately follows the cbr exit
-     *      (we assume this is true if !CLIENT_INTERFACE)
-     * conditions 2 and 3 are asserted in emit.c
-     */
-    return (TEST(FRAG_CBR_FALLTHROUGH_SHORT, flags) && !TEST(FRAG_COARSE_GRAIN, flags) &&
-            ((TEST(FRAG_SHARED, flags) && !DYNAMO_OPTION(unsafe_free_shared_stubs)) ||
-             (!TEST(FRAG_SHARED, flags) && !DYNAMO_OPTION(free_private_stubs))));
-#endif
 }
 
 /* includes the post_linkstub_t offset struct size */
@@ -479,7 +461,11 @@ linkstub_fragment(dcontext_t *dcontext, linkstub_t *l)
             return (fragment_t *)&linkstub_ibl_bb_fragment;
         if (dcontext != NULL && dcontext != GLOBAL_DCONTEXT) {
             thread_link_data_t *ldata = (thread_link_data_t *)dcontext->link_field;
-            if (l == &ldata->linkstub_deleted)
+            /* This point is reachable (via set_last_exit) from initialize_dynamo_context,
+             * which is called by dynamo_thread_init before link_thread_init. The latter
+             * initializes dcontext->link_field, so it's possible for ldata to be NULL.
+             */
+            if (ldata != NULL && l == &ldata->linkstub_deleted)
                 return &ldata->linkstub_deleted_fragment;
         }
         /* For coarse proxies, we need a fake FRAG_SHARED fragment_t for is_linkable */
@@ -799,13 +785,11 @@ get_hot_patch_linkstub()
 }
 #endif
 
-#ifdef CLIENT_INTERFACE
 const linkstub_t *
 get_client_linkstub()
 {
     return &linkstub_client;
 }
-#endif
 
 bool
 is_ibl_sourceless_linkstub(const linkstub_t *l)
@@ -923,7 +907,6 @@ is_cbr_of_cbr_fallthrough(linkstub_t *l)
 void
 separate_stub_create(dcontext_t *dcontext, fragment_t *f, linkstub_t *l)
 {
-    int emit_sz;
     cache_pc stub_pc;
     ASSERT(LINKSTUB_DIRECT(l->flags));
     ASSERT(DYNAMO_OPTION(separate_private_stubs) || DYNAMO_OPTION(separate_shared_stubs));
@@ -954,7 +937,7 @@ separate_stub_create(dcontext_t *dcontext, fragment_t *f, linkstub_t *l)
         ASSERT(dl->stub_pc == EXIT_STUB_PC(dcontext, f, l));
         stub_pc = dl->stub_pc;
     }
-    emit_sz = insert_exit_stub(dcontext, f, l, stub_pc);
+    DEBUG_DECLARE(int emit_sz =) insert_exit_stub(dcontext, f, l, stub_pc);
     ASSERT(emit_sz <= SEPARATE_STUB_ALLOC_SIZE(f->flags));
     DOSTATS({
         size_t alloc_size = SEPARATE_STUB_ALLOC_SIZE(f->flags);
@@ -2313,7 +2296,7 @@ shift_links_to_new_fragment(dcontext_t *dcontext, fragment_t *old_f, fragment_t 
     }
 
     /* For the common case of a trace shadowing a trace head
-     * (happens w/ shared traces, and with CUSTOM_TRACES),
+     * (happens w/ shared traces, and with custom traces),
      * ensure that when we delete the trace we shift back and
      * when we delete the head we don't complain that we're
      * missing links.
@@ -2527,7 +2510,6 @@ static cache_pc
 entrance_stub_create(dcontext_t *dcontext, coarse_info_t *info, fragment_t *f,
                      linkstub_t *l)
 {
-    uint emit_sz;
     cache_pc stub_pc;
     DEBUG_DECLARE(size_t stub_size = COARSE_STUB_ALLOC_SIZE(COARSE_32_FLAG(info));)
     ASSERT(DYNAMO_OPTION(coarse_units));
@@ -2540,7 +2522,7 @@ entrance_stub_create(dcontext_t *dcontext, coarse_info_t *info, fragment_t *f,
     ASSERT((cache_line_size % stub_size) == 0);
     stub_pc = (cache_pc)special_heap_alloc(info->stubs);
     ASSERT(ALIGNED(stub_pc, coarse_stub_alignment(info)));
-    emit_sz = insert_exit_stub(dcontext, f, l, stub_pc);
+    DEBUG_DECLARE(uint emit_sz =) insert_exit_stub(dcontext, f, l, stub_pc);
     LOG(THREAD, LOG_LINKS, 4,
         "created new entrance stub @" PFX " for " PFX " w/ source F%d(" PFX ")." PFX "\n",
         stub_pc, EXIT_TARGET_TAG(dcontext, f, l), f->id, f->tag, FCACHE_ENTRY_PC(f));
@@ -3147,7 +3129,7 @@ coarse_remove_outgoing(dcontext_t *dcontext, cache_pc stub, coarse_info_t *src_i
         ASSERT(target_info != NULL);
         if (target_info != src_info) {
             coarse_incoming_t *e, *prev_e = NULL;
-            bool found = false;
+            DEBUG_DECLARE(bool found = false;)
             unlink_entrance_stub(dcontext, stub, 0, src_info);
             LOG(THREAD, LOG_LINKS, 4, "    removing coarse link " PFX " -> %s " PFX "\n",
                 stub, target_info->module, target_tag);
@@ -3161,7 +3143,7 @@ coarse_remove_outgoing(dcontext_t *dcontext, cache_pc stub, coarse_info_t *src_i
                     LOG(THREAD, LOG_LINKS, 4, "freeing coarse_incoming_t " PFX "\n", e);
                     NONPERSISTENT_HEAP_TYPE_FREE(GLOBAL_DCONTEXT, e, coarse_incoming_t,
                                                  ACCT_COARSE_LINK);
-                    found = true;
+                    DODEBUG(found = true;);
                     break;
                 } else
                     prev_e = e;
@@ -3698,7 +3680,7 @@ coarse_update_outgoing(dcontext_t *dcontext, cache_pc old_stub, cache_pc new_stu
         ASSERT(target_info != NULL);
         if (target_info != src_info) {
             coarse_incoming_t *e;
-            bool found = false;
+            DEBUG_DECLARE(bool found = false;)
             LOG(THREAD, LOG_LINKS, 4,
                 "    %s coarse link [" PFX "=>" PFX "] -> %s " PFX "\n",
                 replace ? "updating" : "adding", old_stub, new_stub, target_info->module,
@@ -3708,7 +3690,7 @@ coarse_update_outgoing(dcontext_t *dcontext, cache_pc old_stub, cache_pc new_stu
                 for (e = target_info->incoming; e != NULL; e = e->next) {
                     if (e->coarse && e->in.stub_pc == old_stub) {
                         e->in.stub_pc = new_stub;
-                        found = true;
+                        DODEBUG(found = true;);
                         break;
                     }
                 }

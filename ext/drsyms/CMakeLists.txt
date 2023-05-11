@@ -1,5 +1,5 @@
 # **********************************************************
-# Copyright (c) 2010-2020 Google, Inc.    All rights reserved.
+# Copyright (c) 2010-2022 Google, Inc.    All rights reserved.
 # Copyright (c) 2010 VMware, Inc.    All rights reserved.
 # **********************************************************
 
@@ -31,7 +31,7 @@
 
 # symbol access library
 
-cmake_minimum_required(VERSION 3.2)
+cmake_minimum_required(VERSION 3.7)
 
 include(../../make/policies.cmake NO_POLICY_SCOPE)
 
@@ -41,7 +41,7 @@ else ()
   set(BITS "32")
 endif ()
 
-if (ARM)
+if (DR_HOST_ARM)
   if (ANDROID)
     set(ARCH "-android")
   else ()
@@ -58,8 +58,12 @@ if (ARM)
   endif ()
 endif()
 
-if (AARCH64)
+if (DR_HOST_AARCH64)
   set(ARCH "-aarch64")
+endif ()
+
+if (DR_HOST_RISCV64)
+  set(ARCH "-riscv64")
 endif ()
 
 # we need libc b/c our elftoolchain libraries use it
@@ -70,7 +74,7 @@ set(DynamoRIO_USE_LIBC ON)
 if (WIN32)
   # XXX: if we add any more of these .lib files we should share this code
   # (currently we have make/ntdll_imports.cmake and here).
-  find_program(LIB_EXECUTABLE lib.exe DOC "path to lib.exe")
+  find_program(LIB_EXECUTABLE lib.exe HINTS "${cl_path}" DOC "path to lib.exe")
   if (NOT LIB_EXECUTABLE)
     message(FATAL_ERROR "Cannot find lib.exe")
   endif (NOT LIB_EXECUTABLE)
@@ -126,9 +130,9 @@ elseif (UNIX)
   if (APPLE)
     set(srcs ${srcs} drsyms_macho.c)
     set(dwarf_libpath
-      "${PROJECT_SOURCE_DIR}/ext/drsyms/libelftc-macho/lib${BITS}/libdwarf.a")
+      "${PROJECT_SOURCE_DIR}/ext/drsyms/libelftc-macho${ARCH}/lib${BITS}/libdwarf.a")
     set(elftc_libpath
-      "${PROJECT_SOURCE_DIR}/ext/drsyms/libelftc-macho/lib${BITS}/libelftc.a")
+      "${PROJECT_SOURCE_DIR}/ext/drsyms/libelftc-macho${ARCH}/lib${BITS}/libelftc.a")
   else (APPLE)
     set(srcs ${srcs} drsyms_elf.c)
     set(dwarf_libpath
@@ -157,7 +161,7 @@ macro(configure_drsyms_target target)
     endif ()
   endif ()
   # we always use the elftoolchain library when building with cmake
-  append_property_string(TARGET ${target} COMPILE_FLAGS "-DDRSYM_HAVE_LIBELFTC")
+  append_property_list(TARGET ${target} COMPILE_DEFINITIONS "DRSYM_HAVE_LIBELFTC")
 endmacro(configure_drsyms_target)
 
 configure_drsyms_target(drsyms)

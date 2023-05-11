@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2020 Google, Inc.  All rights reserved.
+ * Copyright (c) 2020-2021 Google, Inc.  All rights reserved.
  * **********************************************************/
 
 /*
@@ -54,6 +54,13 @@ droption_t<std::string> op_syntax(DROPTION_SCOPE_FRONTEND, "syntax", "intel",
 droption_t<std::string> op_mode(DROPTION_SCOPE_FRONTEND, "mode", "arm",
                                 "Decodes using the specified mode: 'arm' or 'thumb'.",
                                 "Decodes using the specified mode: 'arm' or 'thumb'.");
+#elif defined(AARCH64)
+droption_t<unsigned int>
+    op_sve_vl(DROPTION_SCOPE_FRONTEND, "vl", 128,
+              "Sets the SVE vector length to one of: 128 256 384 512 640 768 896 1024 "
+              "1152 1280 1408 1536 1664 1792 1920 2048.",
+              "Sets the SVE vector length to one of: 128 256 384 512 640 768 896 1024 "
+              "1152 1280 1408 1536 1664 1792 1920 2048.");
 #endif
 
 droption_t<bool> op_show_bytes(DROPTION_SCOPE_FRONTEND, "show_bytes", true,
@@ -76,13 +83,16 @@ parse_bytes(std::string token, std::vector<byte> &bytes)
     // the format for raw data obtained from od or gdb or a binary file.)
     uint64 entry;
     std::stringstream stream;
+    size_t digits = token.size();
+    if (digits > 2 && token[0] == '0' && (token[1] == 'x' || token[1] == 'X'))
+        digits -= 2;
     stream << std::hex << token;
     if (!(stream >> entry))
         return false;
-    do {
+    for (unsigned int i = 0; i < digits / 2; ++i) {
         bytes.push_back(entry & 0xff);
         entry >>= 8;
-    } while (entry > 0);
+    }
     return true;
 }
 };
@@ -130,6 +140,10 @@ main(int argc, const char *argv[])
             return 1;
         }
     }
+#endif
+
+#ifdef AARCH64
+    dr_set_sve_vl(op_sve_vl.get_value());
 #endif
 
     // XXX i#4021: arm not yet supported.

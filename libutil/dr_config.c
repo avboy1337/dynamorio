@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2011-2020 Google, Inc.  All rights reserved.
+ * Copyright (c) 2011-2022 Google, Inc.  All rights reserved.
  * Copyright (c) 2008-2010 VMware, Inc.  All rights reserved.
  * **********************************************************/
 
@@ -40,6 +40,7 @@
 #include "dr_config.h"
 #include "our_tchar.h"
 #include "dr_frontend.h"
+#include "drlibc.h"
 
 /* We use DR's snprintf for consistent behavior when len==max.
  * TODO: Change all of libutil by changing our_tchar.h.
@@ -90,7 +91,7 @@ d_r_snprintf_wide(wchar_t *s, size_t max, const wchar_t *fmt, ...);
 
 extern bool
 create_nudge_signal_payload(siginfo_t *info OUT, uint action_mask, client_id_t client_id,
-                            uint64 client_arg);
+                            uint flags, uint64 client_arg);
 #endif
 
 /* The minimum option size is 3, e.g., "-x ".  Note that we need the
@@ -529,7 +530,7 @@ get_config_file_name(const char *process_name, process_id_t pid, bool global,
     }
 #    else
     {
-        struct stat st;
+        struct stat64 st;
         /* DrMi#1857: with both native and wrapped Android apps using the same
          * config dir but running as different users, we need the dir to be
          * world-writable (this is when SELinux is disabled and a common config
@@ -539,7 +540,8 @@ get_config_file_name(const char *process_name, process_id_t pid, bool global,
 #        ifdef ANDROID
         chmod(fname, 0777); /* umask probably stripped out o+w, so we chmod */
 #        endif
-        if (stat(fname, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        /* Use the raw syscall to avoid glibc 2.33 deps (i#5474). */
+        if (dr_stat_syscall(fname, &st) != 0 || !S_ISDIR(st.st_mode)) {
             DO_ASSERT(false && "failed to create subdir: check permissions");
             return false;
         }
@@ -937,14 +939,7 @@ write_options(opt_info_t *opt_info, TCHAR *wbuf)
          */
         mode_str = "";
         break;
-    default:
-#ifndef CLIENT_INTERFACE
-        /* no API's so no added options */
-        mode_str = "";
-        break;
-#else
-        DO_ASSERT(false);
-#endif
+    default: DO_ASSERT(false);
     }
 
     len = _sntprintf(wbuf + sofar, bufsz - sofar, _TEXT(TSTR_FMT), mode_str);
@@ -1341,6 +1336,15 @@ read_process_policy(IF_REG_ELSE(ConfigGroup *proc_policy, FILE *f),
         return;
     }
 
+    if (debug != NULL) {
+        if (_tcsstr(autoinject, DEBUG32_DLL) != NULL ||
+            _tcsstr(autoinject, DEBUG64_DLL) != NULL) {
+            *debug = true;
+        } else {
+            *debug = false;
+        }
+    }
+
     if (dr_mode != NULL) {
         *dr_mode = opt_info.mode;
         if (read_config_param(IF_REG_ELSE(proc_policy, f),
@@ -1348,15 +1352,6 @@ read_process_policy(IF_REG_ELSE(ConfigGroup *proc_policy, FILE *f),
                               BUFFER_SIZE_ELEMENTS(autoinject))) {
             if (_tcscmp(autoinject, _TEXT("0")) == 0)
                 *dr_mode = DR_MODE_DO_NOT_RUN;
-        }
-    }
-
-    if (debug != NULL) {
-        if (_tcsstr(autoinject, DEBUG32_DLL) != NULL ||
-            _tcsstr(autoinject, DEBUG64_DLL) != NULL) {
-            *debug = true;
-        } else {
-            *debug = false;
         }
     }
 
@@ -1501,6 +1496,70 @@ dr_registered_process_iterator_stop(dr_registered_process_iterator_t *iter)
 }
 
 #endif /* WINDOWS */
+
+dr_config_status_t
+dr_register_inject_paths(const char *process_name, process_id_t pid, bool global,
+                         dr_platform_t dr_platform, const char *dr_lib_path,
+                         const char *dr_alt_lib_path)
+{
+#ifdef PARAMS_IN_REGISTRY
+    ConfigGroup *policy = get_policy(dr_platform);
+    ConfigGroup *proc_policy = get_proc_policy(policy, process_name);
+#else
+    FILE *f = open_config_file(process_name, pid, global, dr_platform, true /*read*/,
+                               true /*write*/, false /*!overwrite*/);
+#endif
+    dr_config_status_t status = DR_SUCCESS;
+    TCHAR wpath[MAXIMUM_PATH];
+    if (IF_REG_ELSE(proc_policy == NULL, f == NULL)) {
+        status = DR_PROC_REG_INVALID;
+        goto exit;
+    }
+    if (dr_lib_path == NULL) {
+        status = DR_CONFIG_INVALID_PARAMETER;
+        goto exit;
+    }
+#ifndef PARAMS_IN_REGISTRY
+    /* shift rest of file up, overwriting old value, so we can append new value */
+    read_config_ex(f, DYNAMORIO_VAR_AUTOINJECT, NULL, 0, true);
+#endif
+    convert_to_tchar(wpath, dr_lib_path, MAXIMUM_PATH);
+    NULL_TERMINATE_BUFFER(wpath);
+    status = write_config_param(IF_REG_ELSE(proc_policy, f),
+                                PARAM_STR(DYNAMORIO_VAR_AUTOINJECT), wpath);
+    if (status != DR_SUCCESS)
+        return status;
+
+    if (dr_alt_lib_path != NULL) {
+#ifndef PARAMS_IN_REGISTRY
+        /* shift rest of file up, overwriting old value, so we can append new value */
+        read_config_ex(f, DYNAMORIO_VAR_ALTINJECT, NULL, 0, true);
+#endif
+        convert_to_tchar(wpath, dr_alt_lib_path, MAXIMUM_PATH);
+        NULL_TERMINATE_BUFFER(wpath);
+        status = write_config_param(IF_REG_ELSE(proc_policy, f),
+                                    PARAM_STR(DYNAMORIO_VAR_ALTINJECT), wpath);
+        if (status != DR_SUCCESS)
+            return status;
+    }
+
+#ifdef PARAMS_IN_REGISTRY
+    /* write the registry */
+    if (write_config_group(policy) != ERROR_SUCCESS) {
+        return DR_FAILURE;
+    }
+#endif
+
+exit:
+#ifdef PARAMS_IN_REGISTRY
+    if (policy != NULL)
+        free_config_group(policy);
+#else
+    if (f != NULL)
+        fclose(f);
+#endif
+    return status;
+}
 
 bool
 dr_process_is_registered(const char *process_name, process_id_t pid, bool global,
@@ -2031,7 +2090,7 @@ dr_nudge_pid(process_id_t process_id, client_id_t client_id, uint64 arg, uint ti
     siginfo_t info;
     int res;
     /* construct the payload */
-    if (!create_nudge_signal_payload(&info, NUDGE_GENERIC(client), client_id, arg))
+    if (!create_nudge_signal_payload(&info, NUDGE_GENERIC(client), 0, client_id, arg))
         return DR_FAILURE;
     /* send the nudge */
     res = syscall(SYS_rt_sigqueueinfo, process_id, NUDGESIG_SIGNUM, &info);

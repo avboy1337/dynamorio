@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2016-2018 Google, Inc.  All rights reserved.
+ * Copyright (c) 2016-2023 Google, Inc.  All rights reserved.
  * **********************************************************/
 
 /*
@@ -43,7 +43,9 @@
 #include "dr_frontend.h"
 #include "analyzer.h"
 #include "histogram_create.h"
-#include "../tests/trace_invariants.h"
+#include "../tools/invariant_checker.h"
+
+using namespace dynamorio::drmemtrace;
 
 #define FATAL_ERROR(msg, ...)                               \
     do {                                                    \
@@ -78,6 +80,9 @@ droption_t<unsigned int> op_verbose(DROPTION_SCOPE_ALL, "verbose", 0, 0, 64,
 // For test simplicity we use this same launcher to run some extra tests.
 droption_t<bool> op_test_mode(DROPTION_SCOPE_ALL, "test_mode", false, "Run tests",
                               "Run extra analyses for testing.");
+droption_t<std::string> op_test_mode_name(DROPTION_SCOPE_ALL, "test_mode_name", "",
+                                          "Test name",
+                                          "Name of extra analyses for testing.");
 
 int
 _tmain(int argc, const TCHAR *targv[])
@@ -100,12 +105,14 @@ _tmain(int argc, const TCHAR *targv[])
         op_line_size.get_value(), op_report_top.get_value(), op_verbose.get_value());
     std::vector<analysis_tool_t *> tools;
     tools.push_back(tool1);
-    trace_invariants_t tool2(true /*offline*/, op_verbose.get_value());
+    invariant_checker_t tool2(true /*offline*/, op_verbose.get_value(),
+                              op_test_mode_name.get_value());
     if (op_test_mode.get_value()) {
         // We use this launcher to run tests as well:
         tools.push_back(&tool2);
     }
-    analyzer_t analyzer(op_trace_dir.get_value(), &tools[0], (int)tools.size());
+    analyzer_t analyzer(op_trace_dir.get_value(), &tools[0], (int)tools.size(), 0, 0,
+                        op_verbose.get_value());
     if (!analyzer) {
         FATAL_ERROR("failed to initialize analyzer: %s",
                     analyzer.get_error_string().c_str());
@@ -117,17 +124,25 @@ _tmain(int argc, const TCHAR *targv[])
     delete tool1;
 
     if (op_test_mode.get_value()) {
-        // Test the external-iterator interface.
+        // Test the direct scheduler_t interface where we control iteration.
         tool1 = histogram_tool_create(op_line_size.get_value(), op_report_top.get_value(),
                                       op_verbose.get_value());
-        analyzer_t external(op_trace_dir.get_value());
-        if (!external) {
-            FATAL_ERROR("failed to initialize analyzer: %s",
-                        external.get_error_string().c_str());
+        scheduler_t scheduler;
+        std::vector<scheduler_t::input_workload_t> sched_inputs;
+        sched_inputs.emplace_back(op_trace_dir.get_value());
+        if (scheduler.init(sched_inputs, 1,
+                           scheduler_t::make_scheduler_serial_options(
+                               op_verbose.get_value())) != scheduler_t::STATUS_SUCCESS) {
+            FATAL_ERROR("failed to initialize scheduler: %s",
+                        scheduler.get_error_string().c_str());
         }
-        for (reader_t &iter = external.begin(); iter != external.end(); ++iter) {
-            std::string error;
-            if (!tool1->process_memref(*iter)) {
+        auto *stream = scheduler.get_stream(0);
+        memref_t record;
+        for (scheduler_t::stream_status_t status = stream->next_record(record);
+             status != scheduler_t::STATUS_EOF; status = stream->next_record(record)) {
+            if (status != scheduler_t::STATUS_OK)
+                FATAL_ERROR("scheduler failed to advance: %d", status);
+            if (!tool1->process_memref(record)) {
                 FATAL_ERROR("tool failed to process entire trace: %s",
                             tool1->get_error_string().c_str());
             }

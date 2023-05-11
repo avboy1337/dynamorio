@@ -1,4 +1,5 @@
 /* **********************************************************
+ * Copyright (c) 2021 Google, Inc.  All rights reserved.
  * Copyright (c) 2016 ARM Limited. All rights reserved.
  * **********************************************************/
 
@@ -35,8 +36,6 @@
 #include "instr.h"
 #include "decode.h"
 #include "disassemble.h"
-
-#if defined(INTERNAL) || defined(DEBUG) || defined(CLIENT_INTERFACE)
 
 static const char *const pred_names[] = {
     "",   /* DR_PRED_NONE */
@@ -76,7 +75,7 @@ print_extra_bytes_to_buffer(char *buf, size_t bufsz, size_t *sofar INOUT, byte *
 static const char *
 shift_name(dr_shift_type_t shift)
 {
-    static const char *const names[] = { "lsl", "lsr", "asr", "ror" };
+    static const char *const names[] = { "lsl", "lsr", "asr", "ror", "mul" };
     int i = shift;
     return (0 <= i && i < sizeof(names) / sizeof(*names) ? names[i] : "<UNKNOWN SHIFT>");
 }
@@ -99,9 +98,12 @@ opnd_base_disp_scale_disassemble(char *buf, size_t bufsz, size_t *sofar INOUT,
     uint amount;
     dr_extend_type_t extend = opnd_get_index_extend(opnd, &scaled, &amount);
     const char *name = extend_name(extend);
-    if (scaled)
+    if (scaled) {
+        if (extend == DR_EXTEND_UXTX)
+            name = shift_name(DR_SHIFT_LSL);
+
         print_to_buffer(buf, bufsz, sofar, ",%s #%d", name, amount);
-    else if (extend != DR_EXTEND_UXTX)
+    } else if (extend != DR_EXTEND_UXTX)
         print_to_buffer(buf, bufsz, sofar, ",%s", name);
 }
 
@@ -146,11 +148,14 @@ void
 print_opcode_name(instr_t *instr, const char *name, char *buf, size_t bufsz,
                   size_t *sofar INOUT)
 {
-    if (instr_get_opcode(instr) == OP_bcond) {
-        print_to_buffer(buf, bufsz, sofar, "b.%s",
-                        pred_names[instr_get_predicate(instr)]);
+    if (instr_get_predicate(instr) != DR_PRED_NONE) {
+        if (instr_get_opcode(instr) == OP_bcond) {
+            print_to_buffer(buf, bufsz, sofar, "b.%s",
+                            pred_names[instr_get_predicate(instr)]);
+        } else {
+            print_to_buffer(buf, bufsz, sofar, "%s.%s", name,
+                            pred_names[instr_get_predicate(instr)]);
+        }
     } else
         print_to_buffer(buf, bufsz, sofar, "%s", name);
 }
-
-#endif /* INTERNAL || DEBUG || CLIENT_INTERFACE */

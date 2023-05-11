@@ -1,5 +1,5 @@
 /* *******************************************************************************
- * Copyright (c) 2019-2020 Google, Inc.  All rights reserved.
+ * Copyright (c) 2019-2023 Google, Inc.  All rights reserved.
  * *******************************************************************************/
 
 /*
@@ -45,6 +45,8 @@
 #    error Rseq is a Linux-only feature
 #endif
 
+/* Routines exported outside of unix/ are in os_exports.h. */
+
 void
 d_r_rseq_init(void);
 
@@ -58,7 +60,7 @@ bool
 rseq_is_registered_for_current_thread(void);
 
 void
-rseq_locate_rseq_regions(void);
+rseq_locate_rseq_regions(bool saw_glibc_rseq_reg);
 
 void
 rseq_module_init(module_area_t *ma, bool at_map);

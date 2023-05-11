@@ -42,16 +42,18 @@ class cache_fifo_t : public cache_t {
 public:
     bool
     init(int associativity, int line_size, int total_size, caching_device_t *parent,
-         caching_device_stats_t *stats, prefetcher_t *prefetcher, bool inclusive = false,
-         bool coherent_cache = false, int id_ = -1,
+         caching_device_stats_t *stats, prefetcher_t *prefetcher = nullptr,
+         bool inclusive = false, bool coherent_cache = false, int id_ = -1,
          snoop_filter_t *snoop_filter_ = nullptr,
          const std::vector<caching_device_t *> &children = {}) override;
 
 protected:
     void
-    access_update(int line_idx, int way) override;
+    access_update(int block_idx, int way) override;
     int
-    replace_which_way(int line_idx) override;
+    replace_which_way(int block_idx) override;
+    int
+    get_next_way_to_replace(const int block_idx) const override;
 };
 
 #endif /* _CACHE_FIFO_H_ */

@@ -1,5 +1,5 @@
 /* *******************************************************************************
- * Copyright (c) 2010-2020 Google, Inc.  All rights reserved.
+ * Copyright (c) 2010-2022 Google, Inc.  All rights reserved.
  * Copyright (c) 2011 Massachusetts Institute of Technology  All rights reserved.
  * Copyright (c) 2000-2010 VMware, Inc.  All rights reserved.
  * *******************************************************************************/
@@ -47,7 +47,9 @@
  * There are 3 different stat syscalls (SYS_oldstat, SYS_stat, and SYS_stat64)
  * and using _LARGEFILE64_SOURCE with SYS_stat64 is the best match.
  */
-#define _LARGEFILE64_SOURCE
+#ifndef _LARGEFILE64_SOURCE
+#    define _LARGEFILE64_SOURCE
+#endif
 /* for mmap-related #defines */
 #include <sys/types.h>
 #include <sys/mman.h>
@@ -128,16 +130,18 @@ typedef struct rlimit64 rlimit64_t;
  * For example, MacOS has some 32-bit syscalls that return 64-bit
  * values in xdx:xax.
  */
-#define MCXT_SYSCALL_RES(mc) ((mc)->IF_X86_ELSE(xax, r0))
-#if defined(AARCH64)
-#    define ASM_R2 "x2"
-#    define ASM_R3 "x3"
-#    define READ_TP_TO_R3_DISP_IN_R2    \
-        "mrs " ASM_R3 ", tpidr_el0\n\t" \
-        "ldr " ASM_R3 ", [" ASM_R3 ", " ASM_R2 "] \n\t"
-#elif defined(ARM)
-#    define ASM_R2 "r2"
-#    define ASM_R3 "r3"
+#define MCXT_SYSCALL_RES(mc) ((mc)->IF_X86_ELSE(xax, IF_RISCV64_ELSE(a0, r0)))
+#if defined(DR_HOST_AARCH64)
+#    if defined(MACOS)
+#        define READ_TP_TO_R3_DISP_IN_R2      \
+            "mrs " ASM_R3 ", tpidrro_el0\n\t" \
+            "ldr " ASM_R3 ", [" ASM_R3 ", " ASM_R2 "] \n\t"
+#    else
+#        define READ_TP_TO_R3_DISP_IN_R2    \
+            "mrs " ASM_R3 ", tpidr_el0\n\t" \
+            "ldr " ASM_R3 ", [" ASM_R3 ", " ASM_R2 "] \n\t"
+#    endif
+#elif defined(DR_HOST_ARM)
 #    define READ_TP_TO_R3_DISP_IN_R2                                           \
         "mrc p15, 0, " ASM_R3                                                  \
         ", c13, c0, " STRINGIFY(USR_TLS_REG_OPCODE) " \n\t"                    \
@@ -181,6 +185,8 @@ char **our_environ;
 #endif
 #ifdef LINUX
 #    include "include/syscall.h" /* our own local copy */
+#    include "include/clone3.h"
+#    include "include/close_range.h"
 #else
 #    include <sys/syscall.h>
 #endif
@@ -189,14 +195,13 @@ char **our_environ;
 #include "../synch.h"
 #include "memquery.h"
 #include "ksynch.h"
+#include "dr_tools.h" /* dr_syscall_result_info_t */
 
 #ifndef HAVE_MEMINFO_QUERY
 #    include "memcache.h"
 #endif
 
-#ifdef CLIENT_INTERFACE
-#    include "instrument.h"
-#endif
+#include "instrument.h"
 
 #ifdef LINUX
 #    include "rseq_linux.h"
@@ -241,13 +246,11 @@ static tls_slot_t *tls_table;
 DECLARE_CXTSWPROT_VAR(mutex_t tls_lock, INIT_LOCK_FREE(tls_lock));
 #endif
 
-#ifdef CLIENT_INTERFACE
 /* Should we place this in a client header?  Currently mentioned in
  * dr_raw_tls_calloc() docs.
  */
 static bool client_tls_allocated[MAX_NUM_CLIENT_TLS];
 DECLARE_CXTSWPROT_VAR(static mutex_t client_tls_lock, INIT_LOCK_FREE(client_tls_lock));
-#endif
 
 #include <stddef.h> /* for offsetof */
 
@@ -276,12 +279,20 @@ handle_app_brk(dcontext_t *dcontext, byte *lowest_brk /*if known*/, byte *old_br
 /* full path to our own library, used for execve */
 static char dynamorio_library_path[MAXIMUM_PATH]; /* just dir */
 static char dynamorio_library_filepath[MAXIMUM_PATH];
+/* Shared between get_dynamo_library_bounds() and get_alt_dynamo_library_bounds(). */
+static char dynamorio_libname_buf[MAXIMUM_PATH];
+static const char *dynamorio_libname = dynamorio_libname_buf;
 /* Issue 20: path to other architecture */
-static char dynamorio_alt_arch_path[MAXIMUM_PATH];
-static char dynamorio_alt_arch_filepath[MAXIMUM_PATH]; /* just dir */
+static char dynamorio_alt_arch_path[MAXIMUM_PATH]; /* just dir */
+static char dynamorio_alt_arch_filepath[MAXIMUM_PATH];
 /* Makefile passes us LIBDIR_X{86,64} defines */
 #define DR_LIBDIR_X86 STRINGIFY(LIBDIR_X86)
 #define DR_LIBDIR_X64 STRINGIFY(LIBDIR_X64)
+
+static void
+get_dynamo_library_bounds(void);
+static void
+get_alt_dynamo_library_bounds(void);
 
 /* pc values delimiting dynamo dll image */
 static app_pc dynamo_dll_start = NULL;
@@ -330,9 +341,21 @@ static int min_dr_fd;
  */
 static generic_table_t *fd_table;
 #define INIT_HTABLE_SIZE_FD 6 /* should remain small */
-#ifdef DEBUG
+/* DR needs to open some files before the fd_table is allocated by d_r_os_init.
+ * This is due to constraints on the order of invoking various init routines in
+ * the dynamorio_app_init_part_* routines.
+ * - dynamorio_app_init_part_one_options opens the global log file when logging
+ *   is enabled in the debug build.
+ * - vmm_heap_unit_init opens the dual_map_file when -satisfy_w_xor_x is set.
+
+ * For these files, fd_table_add would not be able to really add the FD.
+ * Therefore, we have to remember them so that we can add it to fd_table later
+ * when we create it.
+ */
+#define MAX_FD_ADD_PRE_HEAP 2
+static int fd_add_pre_heap[MAX_FD_ADD_PRE_HEAP];
+static int fd_add_pre_heap_flags[MAX_FD_ADD_PRE_HEAP];
 static int num_fd_add_pre_heap;
-#endif
 
 #ifdef LINUX
 /* i#1004: brk emulation */
@@ -431,7 +454,7 @@ __errno_location(void)
 }
 #endif /* !STANDALONE_UNIT_TEST && !STATIC_LIBRARY */
 
-#if defined(HAVE_TLS) && defined(CLIENT_INTERFACE)
+#ifdef HAVE_TLS
 /* i#598
  * (gdb) x/20i (*(errno_loc_t)0xf721e413)
  * 0xf721e413 <__errno_location>:       push   %ebp
@@ -488,6 +511,14 @@ our_libc_errno_loc(void)
  */
 typedef int *(*errno_loc_t)(void);
 
+#ifdef LINUX
+/* Stores whether certain syscalls are unsupported on the system we're running on. */
+static bool is_clone3_enosys = false;
+static bool is_sigqueueinfo_enosys = false;
+#endif
+
+int suspend_signum;
+
 static errno_loc_t
 get_libc_errno_location(bool do_init)
 {
@@ -509,7 +540,6 @@ get_libc_errno_location(bool do_init)
                 ASSERT(libc_errno_loc != NULL);
                 LOG(GLOBAL, LOG_THREADS, 2, "libc errno loc func: " PFX "\n",
                     libc_errno_loc);
-#ifdef CLIENT_INTERFACE
                 /* Currently, the DR is loaded by system loader and hooked up
                  * to app's libc.  So right now, we still need this routine.
                  * we can remove this after libc independency and/or
@@ -521,13 +551,12 @@ get_libc_errno_location(bool do_init)
                         found = false;
                     release_recursive_lock(&privload_lock);
                 }
-#endif
                 if (found)
                     break;
             }
         }
         module_iterator_stop(mi);
-#if defined(HAVE_TLS) && defined(CLIENT_INTERFACE)
+#ifdef HAVE_TLS
         /* i#598: init the libc errno's offset.  If we didn't find libc above,
          * then we don't need to do this.
          */
@@ -845,6 +874,51 @@ get_uname(void)
 #endif
 }
 
+#if defined(LINUX)
+/* For some syscalls, detects whether they are unsupported by the system
+ * we're running on. Particularly, we are interested in detecting missing
+ * support early-on for syscalls that require complex pre-syscall handling
+ * by DR. We use this information to fail early for those syscalls.
+ *
+ * XXX: Move other logic for detecting unsupported syscalls from their
+ * respective locations to here at init time, like that for
+ * SYS_memfd_create in os_create_memory_file.
+ *
+ */
+static void
+detect_unsupported_syscalls()
+{
+    /* We know that when clone3 is available, it fails with EINVAL with
+     * these args.
+     */
+    int clone3_errno =
+        dynamorio_syscall(SYS_clone3, 2, NULL /*clone_args*/, 0 /*clone_args_size*/);
+    ASSERT(clone3_errno == -ENOSYS || clone3_errno == -EINVAL);
+    is_clone3_enosys = clone3_errno == -ENOSYS;
+    /* We expect sigqueueinfo to fail with EFAULT on the NULL but we allow EINVAL
+     * on the signal number to support kernel variation.
+     */
+    int sigqueue_errno = dynamorio_syscall(SYS_rt_tgsigqueueinfo, 4, get_process_id(),
+                                           get_sys_thread_id(), -1, NULL);
+    ASSERT(sigqueue_errno == -ENOSYS || sigqueue_errno == -EINVAL ||
+           sigqueue_errno == -EFAULT);
+    is_sigqueueinfo_enosys = sigqueue_errno == -ENOSYS;
+    if (!IS_STRING_OPTION_EMPTY(xarch_root)) {
+        /* XXX i#5651: QEMU clears si_errno when we send our payload!
+         * For now we pretend this syscall doesn't work, to get basic apps
+         * working under QEMU.
+         */
+        is_sigqueueinfo_enosys = true;
+    }
+}
+#endif
+
+bool
+is_sigqueue_supported(void)
+{
+    return IF_LINUX_ELSE(!is_sigqueueinfo_enosys, false);
+}
+
 /* os-specific initializations */
 void
 d_r_os_init(void)
@@ -856,6 +930,8 @@ d_r_os_init(void)
     /* Populate global data caches. */
     get_application_name();
     get_application_base();
+    get_dynamo_library_bounds();
+    get_alt_dynamo_library_bounds();
 
     /* determine whether gettid is provided and needed for threads,
      * or whether getpid suffices.  even 2.4 kernels have gettid
@@ -886,6 +962,31 @@ d_r_os_init(void)
     vmk_init();
 #endif
 
+#if defined(LINUX)
+    detect_unsupported_syscalls();
+#endif
+
+    /* The signal we use to suspend threads.
+     * We choose a normally-synchronous signal for a lower chance that the app has
+     * blocked it when we attach to an already-running app.
+     * On Linux where we have SYS_rt_sigqueueinfo we use
+     * SIGILL and share with nudges, distinguishing via the NUDGE_IS_SUSPEND flag.
+     * (For pre-2.6.31 Linux kernels without SYS_rt_sigqueueinfo nudges are not
+     * supported so there are no collisions there).
+     * (We initially used SIGSTKFLT but gdb has poor support for it.)
+     * Unfortunately, QEMU crashes when we send SIGILL or SIGFPE to its thread trying
+     * to take it over, so we are forced to dynamically vary the number and we switch
+     * to SIGSTKFLT for QEMU where we live with the lack of gdb support.
+     */
+    suspend_signum = IF_MACOS_ELSE(SIGFPE, NUDGESIG_SIGNUM);
+#ifdef LINUX
+    if (!IS_STRING_OPTION_EMPTY(xarch_root)) {
+        /* We assume we're under QEMU. */
+        LOG(GLOBAL, LOG_TOP | LOG_ASYNCH, 1, "switching suspend signal to SIGSTKFLT\n");
+        suspend_signum = SIGSTKFLT;
+    }
+#endif
+
     d_r_signal_init();
     /* We now set up an early fault handler for d_r_safe_read() (i#350) */
     fault_handling_initialized = true;
@@ -906,10 +1007,14 @@ d_r_os_init(void)
     fd_table = generic_hash_create(
         GLOBAL_DCONTEXT, INIT_HTABLE_SIZE_FD, 80 /* load factor: not perf-critical */,
         HASHTABLE_SHARED | HASHTABLE_PERSISTENT, NULL _IF_DEBUG("fd table"));
-#ifdef DEBUG
-    if (GLOBAL != INVALID_FILE)
-        fd_table_add(GLOBAL, OS_OPEN_CLOSE_ON_FORK);
-#endif
+    /* Add to fd_table the entries that we could not add before as fd_table was
+     * not initialized.
+     */
+    while (num_fd_add_pre_heap > 0) {
+        num_fd_add_pre_heap--;
+        fd_table_add(fd_add_pre_heap[num_fd_add_pre_heap],
+                     fd_add_pre_heap_flags[num_fd_add_pre_heap]);
+    }
 
     /* Ensure initialization */
     get_dynamorio_dll_start();
@@ -1004,16 +1109,6 @@ get_application_pid()
     return get_application_pid_helper(false);
 }
 
-/* i#907: Called during early injection before data section protection to avoid
- * issues with /proc/self/exe.
- */
-void
-set_executable_path(const char *exe_path)
-{
-    strncpy(executable_path, exe_path, BUFFER_SIZE_ELEMENTS(executable_path));
-    NULL_TERMINATE_BUFFER(executable_path);
-}
-
 /* The OSX kernel used to place the bare executable path above envp.
  * On recent XNU versions, the kernel now prefixes the executable path
  * with the string executable_path= so it can be parsed getenv style.
@@ -1094,6 +1189,18 @@ get_application_name(void)
     return get_application_name_helper(false, true /* full path */);
 }
 
+/* i#907: Called during early injection before data section protection to avoid
+ * issues with /proc/self/exe.
+ */
+void
+set_executable_path(const char *exe_path)
+{
+    strncpy(executable_path, exe_path, BUFFER_SIZE_ELEMENTS(executable_path));
+    NULL_TERMINATE_BUFFER(executable_path);
+    /* Re-compute the basename in case the full path changed. */
+    get_application_name_helper(true /* re-compute */, false /* basename */);
+}
+
 /* Note: this is exported so that libdrpreload.so (preload.c) can use it to
  * get process names to do selective process following (PR 212034).  The
  * alternative is to duplicate or compile in this code into libdrpreload.so,
@@ -1121,9 +1228,7 @@ int
 num_app_args()
 {
     if (!DYNAMO_OPTION(early_inject)) {
-#ifdef CLIENT_INTERFACE
         set_client_error_code(NULL, DR_ERROR_NOT_IMPLEMENTED);
-#endif
         return -1;
     }
 
@@ -1135,16 +1240,12 @@ int
 get_app_args(OUT dr_app_arg_t *args_array, int args_count)
 {
     if (args_array == NULL || args_count < 0) {
-#ifdef CLIENT_INTERFACE
         set_client_error_code(NULL, DR_ERROR_INVALID_PARAMETER);
-#endif
         return -1;
     }
 
     if (!DYNAMO_OPTION(early_inject)) {
-#ifdef CLIENT_INTERFACE
         set_client_error_code(NULL, DR_ERROR_NOT_IMPLEMENTED);
-#endif
         return -1;
     }
 
@@ -1242,12 +1343,23 @@ query_time_seconds(void)
     }
 }
 
+#if defined(MACOS) && defined(AARCH64)
+#    include <sys/time.h>
+#endif
+
 /* milliseconds since 1601 */
 uint64
 query_time_millis()
 {
     struct timeval current_time;
+#if !(defined(MACOS) && defined(AARCH64))
     uint64 val = dynamorio_syscall(SYS_gettimeofday, 2, &current_time, NULL);
+#else
+    /* TODO i#5383: Replace with a system call. */
+#    undef gettimeofday /* Remove "gettimeofday_forbidden_function". */
+    uint64 val = gettimeofday(&current_time, NULL);
+#endif
+
 #ifdef MACOS
     /* MacOS before Sierra returns usecs:secs and does not set the timeval struct. */
     if (macos_version < MACOS_VERSION_SIERRA) {
@@ -1343,13 +1455,11 @@ os_slow_exit(void)
 
     if (doing_detach) {
         vsyscall_page_start = NULL;
-        IF_DEBUG(num_fd_add_pre_heap = 0;)
+        ASSERT(num_fd_add_pre_heap == 0);
     }
 
     DELETE_LOCK(set_thread_area_lock);
-#ifdef CLIENT_INTERFACE
     DELETE_LOCK(client_tls_lock);
-#endif
     IF_NO_MEMQUERY(memcache_exit());
 }
 
@@ -1457,7 +1567,14 @@ os_timeout(int time_in_milliseconds)
  * precise constraint, then the compiler would be able to optimize better.  See
  * glibc comments on THREAD_SELF.
  */
-#ifdef MACOS64
+#ifdef DR_HOST_NOT_TARGET
+#    define WRITE_TLS_SLOT_IMM(imm, var) var = 0, ASSERT_NOT_REACHED()
+#    define READ_TLS_SLOT_IMM(imm, var) var = 0, ASSERT_NOT_REACHED()
+#    define WRITE_TLS_INT_SLOT_IMM(imm, var) var = 0, ASSERT_NOT_REACHED()
+#    define READ_TLS_INT_SLOT_IMM(imm, var) var = 0, ASSERT_NOT_REACHED()
+#    define WRITE_TLS_SLOT(offs, var) offs = var ? 0 : 1, ASSERT_NOT_REACHED()
+#    define READ_TLS_SLOT(offs, var) var = (void *)(ptr_uint_t)offs, ASSERT_NOT_REACHED()
+#elif defined(MACOS64) && !defined(AARCH64)
 /* For now we have both a directly-addressable os_local_state_t and a pointer to
  * it in slot 6.  If we settle on always doing the full os_local_state_t in slots,
  * we would probably get rid of the indirection here and directly access slot fields.
@@ -1539,7 +1656,7 @@ os_timeout(int time_in_milliseconds)
         asm("movzw" IF_X64_ELSE("q", "l") " %0, %%" ASM_XAX : : "m"((offs)) : ASM_XAX); \
         asm("mov %" ASM_SEG ":(%%" ASM_XAX "), %%" ASM_XAX : : : ASM_XAX);              \
         asm("mov %%" ASM_XAX ", %0" : "=m"((var)) : : ASM_XAX);
-#elif defined(AARCHXX)
+#elif defined(AARCHXX) && !defined(MACOS)
 /* Android needs indirection through a global.  The Android toolchain has
  * trouble with relocations if we use a global directly in asm, so we convert to
  * a local variable in these macros.  We pay the cost of the extra instructions
@@ -1585,7 +1702,78 @@ os_timeout(int time_in_milliseconds)
                                  : "r"(_base_offs), "r"(offs)                       \
                                  : ASM_R2, ASM_R3);                                 \
         } while (0)
-#endif /* X86/ARM */
+#elif defined(AARCH64) && defined(MACOS)
+
+#    define WRITE_TLS_SLOT_IMM(imm, var) WRITE_TLS_SLOT(imm, var)
+#    define READ_TLS_SLOT_IMM(imm, var) READ_TLS_SLOT(imm, var)
+#    define WRITE_TLS_INT_SLOT_IMM(imm, var) WRITE_TLS_SLOT(imm, var)
+#    define READ_TLS_INT_SLOT_IMM(imm, var) READ_TLS_SLOT(imm, var)
+#    define WRITE_TLS_SLOT(offs, var) \
+        *((__typeof__(var) *)(tls_get_dr_addr() + offs)) = var;
+#    define READ_TLS_SLOT(offs, var) \
+        var = *((__typeof__(var) *)(tls_get_dr_addr() + offs));
+
+#elif defined(RISCV64)
+#    define WRITE_TLS_SLOT_IMM(imm, var)                                       \
+        do {                                                                   \
+            IF_NOT_HAVE_TLS(ASSERT_NOT_REACHED());                             \
+            ASSERT(sizeof(var) == sizeof(void *));                             \
+            __asm__ __volatile__("ld t0, %0(tp) \n\t"                          \
+                                 "sd %1, %2(t0) \n\t"                          \
+                                 :                                             \
+                                 : "i"(DR_TLS_BASE_OFFSET), "r"(var), "i"(imm) \
+                                 : "memory", "t0");                            \
+        } while (0)
+#    define READ_TLS_SLOT_IMM(imm, var)                                \
+        do {                                                           \
+            IF_NOT_HAVE_TLS(ASSERT_NOT_REACHED());                     \
+            ASSERT(sizeof(var) == sizeof(void *));                     \
+            __asm__ __volatile__("ld %0, %1(tp) \n\t"                  \
+                                 "ld %0, %2(%0) \n\t"                  \
+                                 : "=r"(var)                           \
+                                 : "i"(DR_TLS_BASE_OFFSET), "i"(imm)); \
+        } while (0)
+#    define WRITE_TLS_INT_SLOT_IMM(imm, var)                                   \
+        do {                                                                   \
+            IF_NOT_HAVE_TLS(ASSERT_NOT_REACHED());                             \
+            ASSERT(sizeof(var) == sizeof(void *));                             \
+            __asm__ __volatile__("lw t0, %0(tp) \n\t"                          \
+                                 "sw %1, %2(t0) \n\t"                          \
+                                 :                                             \
+                                 : "i"(DR_TLS_BASE_OFFSET), "r"(var), "i"(imm) \
+                                 : "memory", "t0");                            \
+        } while (0)
+#    define READ_TLS_INT_SLOT_IMM(imm, var)                            \
+        do {                                                           \
+            IF_NOT_HAVE_TLS(ASSERT_NOT_REACHED());                     \
+            ASSERT(sizeof(var) == sizeof(void *));                     \
+            __asm__ __volatile__("lw %0, %1(tp) \n\t"                  \
+                                 "lw %0, %2(%0) \n\t"                  \
+                                 : "=r"(var)                           \
+                                 : "i"(DR_TLS_BASE_OFFSET), "i"(imm)); \
+        } while (0)
+#    define WRITE_TLS_SLOT(offs, var)                                           \
+        do {                                                                    \
+            IF_NOT_HAVE_TLS(ASSERT_NOT_REACHED());                              \
+            ASSERT(sizeof(var) == sizeof(void *));                              \
+            __asm__ __volatile__("ld t0, %0(tp) \n\t"                           \
+                                 "add t0, t0, %2\n\t"                           \
+                                 "sd %1, 0(t0) \n\t"                            \
+                                 :                                              \
+                                 : "i"(DR_TLS_BASE_OFFSET), "r"(var), "r"(offs) \
+                                 : "memory", "t0");                             \
+        } while (0)
+#    define READ_TLS_SLOT(offs, var)                                    \
+        do {                                                            \
+            IF_NOT_HAVE_TLS(ASSERT_NOT_REACHED());                      \
+            ASSERT(sizeof(var) == sizeof(void *));                      \
+            __asm__ __volatile__("ld %0, %1(tp) \n\t"                   \
+                                 "add %0, %0, %2\n\t"                   \
+                                 "ld %0, 0(%0) \n\t"                    \
+                                 : "=r"(var)                            \
+                                 : "i"(DR_TLS_BASE_OFFSET), "r"(offs)); \
+        } while (0)
+#endif /* X86/ARM/RISCV64 */
 
 #ifdef X86
 /* We use this at thread init and exit to make it easy to identify
@@ -1598,7 +1786,10 @@ static os_local_state_t uninit_tls; /* has .magic == 0 */
 static bool
 is_thread_tls_initialized(void)
 {
-#ifdef MACOS64
+#if defined(MACOS) && defined(AARCH64)
+    os_local_state_t *v = (void *)tls_get_dr_addr();
+    return v != NULL && v->tls_type == TLS_TYPE_SLOT;
+#elif defined(MACOS64) && !defined(AARCH64)
     /* For now we have both a directly-addressable os_local_state_t and a pointer to
      * it in slot 6.  If we settle on always doing the full os_local_state_t in slots,
      * we would probably get rid of the indirection here and directly read the magic
@@ -1618,6 +1809,14 @@ is_thread_tls_initialized(void)
          * so we'll return false here and use our check in get_thread_private_dcontext().
          */
         if (!first_thread_tls_initialized || last_thread_tls_exited)
+            return false;
+        /* i#3535: Avoid races between removing DR's SIGSEGV signal handler and
+         * detached threads being passed native signals.  The detaching thread is
+         * the one doing all the real cleanup, so we simply avoid any safe reads
+         * or TLS for detaching threads.  This var is not cleared until re-init,
+         * so we have no race with the end of detach.
+         */
+        if (detacher_tid != INVALID_THREAD_ID && detacher_tid != get_sys_thread_id())
             return false;
         /* To handle WSL (i#1986) where fs and gs start out equal to ss (0x2b),
          * and when the MSR is used having a zero selector, and other complexities,
@@ -1644,7 +1843,7 @@ is_thread_tls_initialized(void)
             /* XXX: make this a safe read: but w/o dcontext we need special asm support */
             READ_TLS_SLOT_IMM(TLS_SELF_OFFSET, os_tls);
         }
-#    ifdef X64
+#    if defined(X64) && defined(X86)
         if (os_tls == NULL && tls_dr_using_msr()) {
             /* When the MSR is used, the selector in the register remains 0.
              * We can't clear the MSR early in a new thread and then look for
@@ -1685,7 +1884,12 @@ is_thread_tls_initialized(void)
      * which comes here.
      */
     return true;
+#else
+    /* FIXME i#3544: Not implemented */
+    ASSERT_NOT_IMPLEMENTED(false);
+    return true;
 #endif
+    return true;
 }
 
 bool
@@ -1738,7 +1942,7 @@ os_tls_offset(ushort tls_offs)
     /* no ushort truncation issues b/c TLS_LOCAL_STATE_OFFSET is 0 */
     IF_NOT_HAVE_TLS(ASSERT_NOT_REACHED());
     ASSERT(TLS_LOCAL_STATE_OFFSET == 0);
-    return (TLS_LOCAL_STATE_OFFSET + tls_offs IF_MACOS64(+tls_get_dr_offs()));
+    return (TLS_LOCAL_STATE_OFFSET + tls_offs IF_X86(IF_MACOS64(+tls_get_dr_offs())));
 }
 
 /* converts a segment offset to a local_state_t offset */
@@ -1898,7 +2102,7 @@ d_r_set_tls(ushort tls_offs, void *value)
 byte *
 get_segment_base(uint seg)
 {
-#ifdef MACOS64
+#if defined(MACOS64) && defined(X86)
     ptr_uint_t *pthread_self = (ptr_uint_t *)read_thread_register(seg);
     return (byte *)&pthread_self[SEG_TLS_BASE_OFFSET];
 #elif defined(X86)
@@ -1909,7 +2113,7 @@ get_segment_base(uint seg)
 #    else
     return (byte *)POINTER_MAX;
 #    endif /* HAVE_TLS */
-#elif defined(AARCHXX)
+#elif defined(AARCHXX) || defined(RISCV64)
     /* XXX i#1551: should we rename/refactor to avoid "segment"? */
     return (byte *)read_thread_register(seg);
 #endif
@@ -1925,8 +2129,8 @@ get_app_segment_base(uint seg)
     if (seg == SEG_CS || seg == SEG_SS || seg == SEG_DS || seg == SEG_ES)
         return NULL;
 #endif /* X86 */
-    if (IF_CLIENT_INTERFACE_ELSE(INTERNAL_OPTION(private_loader), false) &&
-        first_thread_tls_initialized && !last_thread_tls_exited) {
+    if (INTERNAL_OPTION(private_loader) && first_thread_tls_initialized &&
+        !last_thread_tls_exited) {
         return d_r_get_tls(os_get_app_tls_base_offset(seg));
     }
     return get_segment_base(seg);
@@ -2069,7 +2273,7 @@ os_tls_app_seg_init(os_local_state_t *os_tls, void *segment)
     os_tls->os_seg_info.priv_alt_tls_base = IF_X86_ELSE(segment, NULL);
 
     /* now allocate the tls segment for client libraries */
-    if (IF_CLIENT_INTERFACE_ELSE(INTERNAL_OPTION(private_loader), false)) {
+    if (INTERNAL_OPTION(private_loader)) {
         os_tls->os_seg_info.priv_lib_tls_base = IF_UNIT_TEST_ELSE(
             os_tls->app_lib_tls_base, privload_tls_init(os_tls->app_lib_tls_base));
     }
@@ -2107,7 +2311,8 @@ os_tls_init(void)
      */
     byte *segment = tls_get_dr_addr();
 #    else
-    byte *segment = heap_mmap(PAGE_SIZE, MEMPROT_READ | MEMPROT_WRITE, VMM_SPECIAL_MMAP);
+    byte *segment = heap_mmap(PAGE_SIZE, MEMPROT_READ | MEMPROT_WRITE,
+                              VMM_SPECIAL_MMAP | VMM_PER_THREAD);
 #    endif
     os_local_state_t *os_tls = (os_local_state_t *)segment;
 
@@ -2116,7 +2321,7 @@ os_tls_init(void)
     ASSERT(!is_thread_tls_initialized());
 
     /* MUST zero out dcontext slot so uninit access gets NULL */
-    memset(segment, 0, PAGE_SIZE);
+    memset(segment, 0, IF_MACOSA64_ELSE(sizeof(os_local_state_t), PAGE_SIZE));
     /* store key data in the tls itself */
     os_tls->self = os_tls;
     os_tls->tid = get_sys_thread_id();
@@ -2246,7 +2451,7 @@ os_tls_exit(local_state_t *local_state, bool other_thread)
     /* ASSUMPTION: local_state_t is laid out at same start as local_state_extended_t */
     os_local_state_t *os_tls =
         (os_local_state_t *)(((byte *)local_state) - offsetof(os_local_state_t, state));
-    heap_munmap(os_tls->self, PAGE_SIZE, VMM_SPECIAL_MMAP);
+    heap_munmap(os_tls->self, PAGE_SIZE, VMM_SPECIAL_MMAP | VMM_PER_THREAD);
 #    endif
 #else
     global_heap_free(tls_table, MAX_THREADS * sizeof(tls_slot_t) HEAPACCT(ACCT_OTHER));
@@ -2288,7 +2493,6 @@ os_tls_pre_init(int gdt_index)
 #endif /* X86/ARM */
 }
 
-#ifdef CLIENT_INTERFACE
 /* Allocates num_slots tls slots aligned with alignment align */
 bool
 os_tls_calloc(OUT uint *offset, uint num_slots, uint alignment)
@@ -2339,7 +2543,6 @@ os_tls_cfree(uint offset, uint num_slots)
     d_r_mutex_unlock(&client_tls_lock);
     return ok;
 }
-#endif
 
 /* os_data is a clone_record_t for signal_thread_inherit */
 void
@@ -2393,12 +2596,10 @@ os_thread_init(dcontext_t *dcontext, void *os_data)
     }
 #endif
 
-    LOG(THREAD, LOG_THREADS, 1, "post-TLS-setup, cur %s base is " PFX "\n",
-        IF_X86_ELSE("gs", "tpidruro"),
-        get_segment_base(IF_X86_ELSE(SEG_GS, DR_REG_TPIDRURO)));
-    LOG(THREAD, LOG_THREADS, 1, "post-TLS-setup, cur %s base is " PFX "\n",
-        IF_X86_ELSE("fs", "tpidrurw"),
-        get_segment_base(IF_X86_ELSE(SEG_FS, DR_REG_TPIDRURW)));
+    LOG(THREAD, LOG_THREADS, 1, "post-TLS-setup, cur %s base is " PFX "\n", STR_SEG,
+        get_segment_base(SEG_TLS));
+    LOG(THREAD, LOG_THREADS, 1, "post-TLS-setup, cur %s base is " PFX "\n", STR_LIB_SEG,
+        get_segment_base(LIB_SEG_TLS));
 
 #ifdef MACOS
     /* XXX: do we need to free/close dcontext->thread_port?  I don't think so. */
@@ -2446,23 +2647,20 @@ os_thread_exit(dcontext_t *dcontext, bool other_thread)
             /* FIXME i#2088: we need to restore the app's aux seg, if any, instead. */
             os_set_dr_tls_base(dcontext, NULL, (byte *)&uninit_tls);
         }
-        DODEBUG({
-            HEAP_TYPE_FREE(dcontext, ostd->clone_tls, os_local_state_t, ACCT_THREAD_MGT,
-                           UNPROTECTED);
-        });
+        /* We have to free in release build too b/c "local unprotected" is global. */
+        HEAP_TYPE_FREE(dcontext, ostd->clone_tls, os_local_state_t, ACCT_THREAD_MGT,
+                       UNPROTECTED);
     }
 #endif
 
+    if (INTERNAL_OPTION(private_loader))
+        privload_tls_exit(IF_UNIT_TEST_ELSE(NULL, ostd->priv_lib_tls_base));
     /* for non-debug we do fast exit path and don't free local heap */
     DODEBUG({
         if (MACHINE_TLS_IS_DR_TLS) {
 #ifdef X86
             heap_free(dcontext, ostd->app_thread_areas,
                       sizeof(our_modify_ldt_t) * GDT_NUM_TLS_SLOTS HEAPACCT(ACCT_OTHER));
-#endif
-#ifdef CLIENT_INTERFACE
-            if (INTERNAL_OPTION(private_loader))
-                privload_tls_exit(IF_UNIT_TEST_ELSE(NULL, ostd->priv_lib_tls_base));
 #endif
         }
         heap_free(dcontext, ostd, sizeof(os_thread_data_t) HEAPACCT(ACCT_OTHER));
@@ -2634,6 +2832,13 @@ os_swap_dr_tls(dcontext_t *dcontext, bool to_app)
             os_set_dr_tls_base(dcontext, real_tls, (byte *)real_tls);
         }
     }
+#elif defined(AARCHXX)
+    /* For aarchxx we don't have a separate thread register for DR, and we
+     * always leave the DR pointer in the slot inside the app's or privlib's TLS.
+     * That means we have nothing to do here.
+     * For SYS_clone, we are ok with the parent's TLS being inherited until
+     * new_thread_setup() calls set_thread_register_from_clone_record().
+     */
 #endif
 }
 
@@ -2660,7 +2865,7 @@ os_clone_pre(dcontext_t *dcontext)
     /* We switch the lib tls segment back to app's segment.
      * Please refer to comment on os_switch_lib_tls.
      */
-    if (IF_CLIENT_INTERFACE_ELSE(INTERNAL_OPTION(private_loader), false)) {
+    if (INTERNAL_OPTION(private_loader)) {
         os_switch_lib_tls(dcontext, true /*to app*/);
     }
     os_swap_dr_tls(dcontext, true /*to app*/);
@@ -2692,15 +2897,9 @@ os_should_swap_state(void)
 {
 #ifdef X86
     /* -private_loader currently implies -mangle_app_seg, but let's be safe. */
-    return (INTERNAL_OPTION(mangle_app_seg) &&
-            IF_CLIENT_INTERFACE_ELSE(INTERNAL_OPTION(private_loader), false));
-#elif defined(AARCHXX)
-    /* FIXME i#1582: this should return true, but there is a lot of complexity
-     * getting os_switch_seg_to_context() to do the right then when called
-     * at main thread init, secondary thread init, early and late injection,
-     * and thread exit, since it is fragile with its writes to app TLS.
-     */
-    return false;
+    return (INTERNAL_OPTION(mangle_app_seg) && INTERNAL_OPTION(private_loader));
+#elif defined(AARCHXX) || defined(RISCV64)
+    return INTERNAL_OPTION(private_loader);
 #endif
 }
 
@@ -2733,20 +2932,6 @@ os_swap_context(dcontext_t *dcontext, bool to_app, dr_state_flags_t flags)
         os_switch_seg_to_context(dcontext, LIB_SEG_TLS, to_app);
     if (TEST(DR_STATE_DR_TLS, flags))
         os_swap_dr_tls(dcontext, to_app);
-}
-
-void
-os_swap_context_go_native(dcontext_t *dcontext, dr_state_flags_t flags)
-{
-#ifdef AARCHXX
-    /* FIXME i#1582: remove this routine once os_should_swap_state()
-     * is not disabled and we can actually call
-     * os_swap_context_go_native() safely from multiple places.
-     */
-    os_switch_seg_to_context(dcontext, LIB_SEG_TLS, true /*to app*/);
-#else
-    os_swap_context(dcontext, true /*to app*/, flags);
-#endif
 }
 
 void
@@ -2889,7 +3074,7 @@ get_thread_private_dcontext(void)
      * thread's initialization (see comments below on that).
      */
     if (!is_thread_tls_initialized())
-        return (IF_CLIENT_INTERFACE(standalone_library ? GLOBAL_DCONTEXT :) NULL);
+        return standalone_library ? GLOBAL_DCONTEXT : NULL;
     /* We used to check tid and return NULL to distinguish parent from child, but
      * that was affecting performance (xref PR 207366: but I'm leaving the assert in
      * for now so debug build will still incur it).  So we fixed the cases that
@@ -3078,6 +3263,10 @@ os_raw_mem_alloc(void *preferred, size_t size, uint prot, uint flags,
     uint os_prot = memprot_to_osprot(prot);
     uint os_flags =
         MAP_PRIVATE | MAP_ANONYMOUS | (TEST(RAW_ALLOC_32BIT, flags) ? MAP_32BIT : 0);
+#if defined(MACOS) && defined(AARCH64)
+    if (TEST(MEMPROT_EXEC, prot))
+        os_flags |= MAP_JIT;
+#endif
 
     ASSERT(error_code != NULL);
     /* should only be used on aligned pieces */
@@ -3163,7 +3352,7 @@ emulate_app_brk(dcontext_t *dcontext, byte *new_val)
 }
 #endif /* LINUX */
 
-#if defined(CLIENT_INTERFACE) && defined(LINUX)
+#ifdef LINUX
 DR_API
 /* XXX: could add dr_raw_mem_realloc() instead of dr_raw_mremap() -- though there
  * is no realloc for Windows: supposed to reserve yourself and then commit in
@@ -3216,7 +3405,7 @@ dr_raw_brk(void *new_address)
         }
     }
 }
-#endif /* CLIENT_INTERFACE && LINUX */
+#endif /* LINUX */
 
 /* caller is required to handle thread synchronization and to update dynamo vm areas */
 void
@@ -3269,15 +3458,17 @@ os_heap_reserve(void *preferred, size_t size, heap_error_code_t *error_code,
     /* should only be used on aligned pieces */
     ASSERT(size > 0 && ALIGNED(size, PAGE_SIZE));
     ASSERT(error_code != NULL);
+    uint os_flags = MAP_PRIVATE |
+        MAP_ANONYMOUS IF_X64(| (DYNAMO_OPTION(heap_in_lower_4GB) ? MAP_32BIT : 0));
+#if defined(MACOS) && defined(AARCH64)
+    if (executable)
+        os_flags |= MAP_JIT;
+#endif
 
     /* FIXME: note that this memory is in fact still committed - see man mmap */
     /* FIXME: case 2347 on Linux or -vm_reserve should be set to false */
     /* FIXME: Need to actually get a mmap-ing with |MAP_NORESERVE */
-    p = mmap_syscall(
-        preferred, size, prot,
-        MAP_PRIVATE |
-            MAP_ANONYMOUS IF_X64(| (DYNAMO_OPTION(heap_in_lower_4GB) ? MAP_32BIT : 0)),
-        -1, 0);
+    p = mmap_syscall(preferred, size, prot, os_flags, -1, 0);
     if (!mmap_syscall_succeeded(p)) {
         *error_code = -(heap_error_code_t)(ptr_int_t)p;
         LOG(GLOBAL, LOG_HEAP, 4, "os_heap_reserve %d bytes failed " PFX "\n", size, p);
@@ -3345,6 +3536,7 @@ os_heap_reserve_in_region(void *start, void *end, size_t size,
                           heap_error_code_t *error_code, bool executable)
 {
     byte *p = NULL;
+    void *find_start = start;
     byte *try_start = NULL, *try_end = NULL;
     uint iters = 0;
 
@@ -3361,7 +3553,7 @@ os_heap_reserve_in_region(void *start, void *end, size_t size,
 
         /* loop to handle races */
 #define RESERVE_IN_REGION_MAX_ITERS 128
-    while (find_free_memory_in_region(start, end, size, &try_start, &try_end)) {
+    while (find_free_memory_in_region(find_start, end, size, &try_start, &try_end)) {
         /* If there's space we'd prefer the end, to avoid the common case of
          * a large binary + heap at attach where we're likely to reserve
          * right at the start of the brk: we'd prefer to leave more brk space.
@@ -3376,6 +3568,7 @@ os_heap_reserve_in_region(void *start, void *end, size_t size,
             ASSERT_NOT_REACHED();
             break;
         }
+        find_start = try_end;
     }
     if (p == NULL)
         *error_code = HEAP_ERROR_CANT_RESERVE_IN_REGION;
@@ -3422,7 +3615,6 @@ os_heap_commit(void *p, size_t size, uint prot, heap_error_code_t *error_code)
 void
 os_heap_decommit(void *p, size_t size, heap_error_code_t *error_code)
 {
-    int rc;
     ASSERT(error_code != NULL);
 
     if (!dynamo_exited)
@@ -3430,14 +3622,12 @@ os_heap_decommit(void *p, size_t size, heap_error_code_t *error_code)
 
     *error_code = HEAP_ERROR_SUCCESS;
     /* FIXME: for now do nothing since os_heap_reserve has in fact committed the memory */
-    rc = 0;
     /* TODO:
            p = mmap_syscall(p, size, PROT_NONE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
        we should either do a mremap()
        or we can do a munmap() followed 'quickly' by a mmap() -
        also see above the comment that os_heap_reserve() in fact is not so lightweight
     */
-    ASSERT(rc == 0);
 }
 
 bool
@@ -3476,13 +3666,31 @@ thread_signal(process_id_t pid, thread_id_t tid, int signum)
     ASSERT_NOT_IMPLEMENTED(false);
     return false;
 #else
-    /* FIXME: for non-NPTL use SYS_kill */
     /* Note that the pid is equivalent to the thread group id.
      * However, we can have threads sharing address space but not pid
      * (if created via CLONE_VM but not CLONE_THREAD), so make sure to
      * use the pid of the target thread, not our pid.
      */
     return (dynamorio_syscall(SYS_tgkill, 3, pid, tid, signum) == 0);
+#endif
+}
+
+/* This is not available on all platforms/kernels and so may fail. */
+bool
+thread_signal_queue(process_id_t pid, thread_id_t tid, int signum, void *value)
+{
+#ifdef MACOS
+    return false;
+#else
+    kernel_siginfo_t info;
+    memset(&info, 0, sizeof(info));
+    info.si_signo = signum;
+    info.si_code = SI_QUEUE;
+    info.si_value.sival_ptr = value;
+    /* SYS_rt_sigqueueinfo is on 2.6.31+ so we expect failure on older kernels.
+     * The caller can use is_sigqueue_supported() to check.
+     */
+    return dynamorio_syscall(SYS_rt_tgsigqueueinfo, 4, pid, tid, signum, &info) == 0;
 #endif
 }
 
@@ -3553,6 +3761,37 @@ os_thread_sleep(uint64 milliseconds)
 #endif
 }
 
+/* For an unknown thread, pass tr==NULL.  Always pass pid and tid. */
+static bool
+send_suspend_signal(thread_record_t *tr, pid_t pid, thread_id_t tid)
+{
+#ifdef MACOS
+    if (tr != NULL)
+        return known_thread_signal(tr, SUSPEND_SIGNAL);
+    else
+        return thread_signal(pid, tid, SUSPEND_SIGNAL);
+#else
+    if (is_sigqueueinfo_enosys) {
+        /* We'd prefer to use sigqueueinfo to better distinguish our signals from app
+         * signals, and to support SUSPEND_SIGNAL == NUDGESIG_SIGNUM.  If sigqueueinfo
+         * is not available and SUSPEND_SIGNAL == NUDGESIG_SIGNUM, we won't be able to
+         * distinguish a suspend from a nudge, but we don't support nudges on old Linux
+         * kernels anyway (<2.6.31).
+         */
+        if (tr != NULL)
+            return known_thread_signal(tr, SUSPEND_SIGNAL);
+        else
+            return thread_signal(pid, tid, SUSPEND_SIGNAL);
+    }
+    kernel_siginfo_t info;
+    if (!create_nudge_signal_payload(&info, 0, NUDGE_IS_SUSPEND, 0, 0))
+        return false;
+    ptr_int_t res =
+        dynamorio_syscall(SYS_rt_tgsigqueueinfo, 4, pid, tid, SUSPEND_SIGNAL, &info);
+    return (res >= 0);
+#endif
+}
+
 bool
 os_thread_suspend(thread_record_t *tr)
 {
@@ -3575,7 +3814,7 @@ os_thread_suspend(thread_record_t *tr)
          * to match Windows behavior.
          */
         ASSERT(ksynch_get_value(&ostd->suspended) == 0);
-        if (!known_thread_signal(tr, SUSPEND_SIGNAL)) {
+        if (!send_suspend_signal(tr, tr->pid, tr->id)) {
             ostd->suspend_count--;
             d_r_mutex_unlock(&ostd->suspend_lock);
             return false;
@@ -3654,7 +3893,7 @@ bool
 os_thread_terminate(thread_record_t *tr)
 {
     /* PR 297902: for NPTL sending SIGKILL will take down the whole group:
-     * so instead we send SIGUSR2 and have a flag set telling
+     * so instead we send SUSPEND_SIGNAL and have a flag set telling
      * target thread to execute SYS_exit
      */
     os_thread_data_t *ostd = (os_thread_data_t *)tr->dcontext->os_field;
@@ -3663,7 +3902,7 @@ os_thread_terminate(thread_record_t *tr)
     /* Even if the thread is currently suspended, it's simpler to send it
      * another signal than to resume it.
      */
-    return known_thread_signal(tr, SUSPEND_SIGNAL);
+    return send_suspend_signal(tr, tr->pid, tr->id);
 }
 
 bool
@@ -3726,6 +3965,8 @@ thread_get_mcontext(thread_record_t *tr, priv_mcontext_t *mc)
         return false;
     ASSERT(ostd->suspended_sigcxt != NULL);
     sigcontext_to_mcontext(mc, ostd->suspended_sigcxt, DR_MC_ALL);
+    IF_ARM(dr_set_isa_mode(tr->dcontext, get_sigcontext_isa_mode(ostd->suspended_sigcxt),
+                           NULL));
     return true;
 }
 
@@ -3742,6 +3983,8 @@ thread_set_mcontext(thread_record_t *tr, priv_mcontext_t *mc)
         return false;
     ASSERT(ostd->suspended_sigcxt != NULL);
     mcontext_to_sigcontext(ostd->suspended_sigcxt, mc, DR_MC_ALL);
+    IF_ARM(
+        set_sigcontext_isa_mode(ostd->suspended_sigcxt, dr_get_isa_mode(tr->dcontext)));
     return true;
 }
 
@@ -3779,8 +4022,7 @@ is_thread_currently_native(thread_record_t *tr)
             (tr->dcontext != NULL && tr->dcontext->currently_stopped));
 }
 
-#ifdef CLIENT_SIDELINE /* PR 222812: tied to sideline usage */
-#    ifdef LINUX       /* XXX i#58: just until we have Mac support */
+#ifdef LINUX /* XXX i#58: just until we have Mac support */
 static void
 client_thread_run(void)
 {
@@ -3822,7 +4064,7 @@ client_thread_run(void)
     block_cleanup_and_terminate(dcontext, SYS_exit, 0, 0, false /*just thread*/,
                                 IF_MACOS_ELSE(dcontext->thread_port, 0), 0);
 }
-#    endif
+#endif
 
 /* i#41/PR 222812: client threads
  * * thread must have dcontext since many API routines require one and we
@@ -3838,7 +4080,7 @@ client_thread_run(void)
 DR_API bool
 dr_create_client_thread(void (*func)(void *param), void *arg)
 {
-#    ifdef LINUX
+#ifdef LINUX
     dcontext_t *dcontext = get_thread_private_dcontext();
     byte *xsp;
     /* We do not pass SIGCHLD since don't want signal to parent and don't support
@@ -3856,7 +4098,7 @@ dr_create_client_thread(void (*func)(void *param), void *arg)
     /* need to share signal handler table, prior to creating clone record */
     handle_clone(dcontext, flags);
     ATOMIC_INC(int, uninit_thread_count);
-    void *crec = create_clone_record(dcontext, (reg_t *)&xsp);
+    void *crec = create_clone_record(dcontext, (reg_t *)&xsp, NULL, NULL);
     /* make sure client_thread_run can get the func and arg, and that
      * signal_thread_inherit gets the right syscall info
      */
@@ -3868,11 +4110,23 @@ dr_create_client_thread(void (*func)(void *param), void *arg)
      * to the app's.
      */
     os_clone_pre(dcontext);
+#    ifdef AARCHXX
+    /* We need to invalidate DR's TLS to avoid get_thread_private_dcontext() finding one
+     * and hitting asserts in dynamo_thread_init lock calls -- yet we don't want to for
+     * app threads, so we're doing this here and not in os_clone_pre().
+     * XXX: Find a way to put this in os_clone_* to simplify the code?
+     */
+    void *tls = (void *)read_thread_register(LIB_SEG_TLS);
+    write_thread_register(NULL);
+#    endif
     thread_id_t newpid = dynamorio_clone(flags, xsp, NULL, NULL, NULL, client_thread_run);
     /* i#3526 switch DR's tls back to the original one before cloning. */
     os_clone_post(dcontext);
+#    ifdef AARCHXX
+    write_thread_register(tls);
+#    endif
     /* i#501 the app's tls was switched in os_clone_pre. */
-    if (IF_CLIENT_INTERFACE_ELSE(INTERNAL_OPTION(private_loader), false))
+    if (INTERNAL_OPTION(private_loader))
         os_switch_lib_tls(dcontext, false /*to dr*/);
     if (newpid < 0) {
         LOG(THREAD, LOG_ALL, 1, "client thread creation failed: %d\n", newpid);
@@ -3883,12 +4137,11 @@ dr_create_client_thread(void (*func)(void *param), void *arg)
         return false;
     }
     return true;
-#    else
+#else
     ASSERT_NOT_IMPLEMENTED(false); /* FIXME i#58: implement on Mac */
     return false;
-#    endif
+#endif
 }
-#endif /* CLIENT_SIDELINE PR 222812: tied to sideline usage */
 
 int
 get_num_processors(void)
@@ -3928,67 +4181,64 @@ get_num_processors(void)
  * with -no_private_loader, so this should never happen.
  */
 
-#if defined(CLIENT_INTERFACE) || defined(HOT_PATCHING_INTERFACE)
 shlib_handle_t
 load_shared_library(const char *name, bool reachable)
 {
-#    ifdef STATIC_LIBRARY
+#ifdef STATIC_LIBRARY
     if (os_files_same(name, get_application_name())) {
         /* The private loader falls back to dlsym() and friends for modules it
          * doesn't recognize, so this works without disabling the private loader.
          */
         return dlopen(NULL, RTLD_LAZY); /* Gets a handle to the exe. */
     }
-#    endif
+#endif
     /* We call locate_and_load_private_library() to support searching for
      * a pathless name.
      */
-    if (IF_CLIENT_INTERFACE_ELSE(INTERNAL_OPTION(private_loader), false))
+    if (INTERNAL_OPTION(private_loader))
         return (shlib_handle_t)locate_and_load_private_library(name, reachable);
-#    if defined(STATIC_LIBRARY) || defined(MACOS)
+#if defined(STATIC_LIBRARY) || defined(MACOS)
     ASSERT(!DYNAMO_OPTION(early_inject));
     return dlopen(name, RTLD_LAZY);
-#    else
+#else
     /* -no_private_loader is no longer supported in our default builds.
      * If we want it for hybrid mode we should add a new build param and include
      * the libdl calls here under that param.
      */
     ASSERT_NOT_REACHED();
     return NULL;
-#    endif
-}
 #endif
+}
 
-#if defined(CLIENT_INTERFACE)
 shlib_routine_ptr_t
 lookup_library_routine(shlib_handle_t lib, const char *name)
 {
-    if (IF_CLIENT_INTERFACE_ELSE(INTERNAL_OPTION(private_loader), false)) {
+    if (INTERNAL_OPTION(private_loader)) {
         return (shlib_routine_ptr_t)get_private_library_address((app_pc)lib, name);
     }
-#    if defined(STATIC_LIBRARY) || defined(MACOS)
+#if defined(STATIC_LIBRARY) || defined(MACOS)
     ASSERT(!DYNAMO_OPTION(early_inject));
     return dlsym(lib, name);
-#    else
+#else
     ASSERT_NOT_REACHED(); /* -no_private_loader is no longer supported: see above */
     return NULL;
-#    endif
+#endif
 }
 
 void
 unload_shared_library(shlib_handle_t lib)
 {
-    if (IF_CLIENT_INTERFACE_ELSE(INTERNAL_OPTION(private_loader), false)) {
+    if (INTERNAL_OPTION(private_loader)) {
         unload_private_library(lib);
     } else {
-#    if defined(STATIC_LIBRARY) || defined(MACOS)
+#if defined(STATIC_LIBRARY) || defined(MACOS)
         ASSERT(!DYNAMO_OPTION(early_inject));
         if (!DYNAMO_OPTION(avoid_dlclose)) {
             dlclose(lib);
         }
-#    else
+#else
         ASSERT_NOT_REACHED(); /* -no_private_loader is no longer supported: see above  */
-#    endif
+#endif
     }
 }
 
@@ -3996,19 +4246,19 @@ void
 shared_library_error(char *buf, int maxlen)
 {
     const char *err;
-    if (IF_CLIENT_INTERFACE_ELSE(INTERNAL_OPTION(private_loader), false)) {
+    if (INTERNAL_OPTION(private_loader)) {
         err = "error in private loader";
     } else {
-#    if defined(STATIC_LIBRARY) || defined(MACOS)
+#if defined(STATIC_LIBRARY) || defined(MACOS)
         ASSERT(!DYNAMO_OPTION(early_inject));
         err = dlerror();
         if (err == NULL) {
             err = "dlerror returned NULL";
         }
-#    else
+#else
         ASSERT_NOT_REACHED(); /* -no_private_loader is no longer supported */
         err = "unknown error";
-#    endif
+#endif
     }
     strncpy(buf, err, maxlen - 1);
     buf[maxlen - 1] = '\0'; /* strncpy won't put on trailing null if maxes out */
@@ -4027,7 +4277,7 @@ shared_library_bounds(IN shlib_handle_t lib, IN byte *addr, IN const char *name,
      */
     ASSERT(addr != NULL || name != NULL);
     *start = addr;
-    if (IF_CLIENT_INTERFACE_ELSE(INTERNAL_OPTION(private_loader), false)) {
+    if (INTERNAL_OPTION(private_loader)) {
         privmod_t *mod;
         /* look for private library first */
         acquire_recursive_lock(&privload_lock);
@@ -4045,7 +4295,6 @@ shared_library_bounds(IN shlib_handle_t lib, IN byte *addr, IN const char *name,
     }
     return (memquery_library_bounds(name, start, end, NULL, 0, NULL, 0) > 0);
 }
-#endif /* defined(CLIENT_INTERFACE) */
 
 static int
 fcntl_syscall(int fd, int cmd, long arg)
@@ -4111,11 +4360,29 @@ fd_table_add(file_t fd, uint flags)
                          (void *)(ptr_uint_t)(flags | OS_OPEN_RESERVED));
         TABLE_RWLOCK(fd_table, write, unlock);
     } else {
-#ifdef DEBUG
-        num_fd_add_pre_heap++;
-        /* we add main_logfile in d_r_os_init() */
-        ASSERT(num_fd_add_pre_heap == 1 && "only main_logfile should come here");
-#endif
+        /* We come here only for the main_logfile and the dual_map_file, which
+         * we add to the fd_table in d_r_os_init().
+         */
+        ASSERT(num_fd_add_pre_heap < MAX_FD_ADD_PRE_HEAP &&
+               num_fd_add_pre_heap < (DYNAMO_OPTION(satisfy_w_xor_x) ? 2 : 1) &&
+               "only main_logfile and dual_map_file should come here");
+        if (num_fd_add_pre_heap < MAX_FD_ADD_PRE_HEAP) {
+            fd_add_pre_heap[num_fd_add_pre_heap] = fd;
+            fd_add_pre_heap_flags[num_fd_add_pre_heap] = flags;
+            num_fd_add_pre_heap++;
+        }
+    }
+}
+
+void
+fd_table_remove(file_t fd)
+{
+    if (fd_table != NULL) {
+        TABLE_RWLOCK(fd_table, write, lock);
+        generic_hash_remove(GLOBAL_DCONTEXT, fd_table, (ptr_uint_t)fd);
+        TABLE_RWLOCK(fd_table, write, unlock);
+    } else {
+        ASSERT(dynamo_exited || standalone_library);
     }
 }
 
@@ -4165,12 +4432,7 @@ os_open_protected(const char *fname, int os_open_flags)
 void
 os_close_protected(file_t f)
 {
-    ASSERT(fd_table != NULL || dynamo_exited);
-    if (fd_table != NULL) {
-        TABLE_RWLOCK(fd_table, write, lock);
-        generic_hash_remove(GLOBAL_DCONTEXT, fd_table, (ptr_uint_t)f);
-        TABLE_RWLOCK(fd_table, write, unlock);
-    }
+    fd_table_remove(f);
     os_close(f);
 }
 
@@ -4240,7 +4502,8 @@ os_map_file(file_t f, size_t *size INOUT, uint64 offs, app_pc addr, uint prot,
      * in particular): for low 4GB, easiest to just pass MAP_32BIT (which is
      * low 2GB, but good enough).
      */
-    if (DYNAMO_OPTION(heap_in_lower_4GB) && !TEST(MAP_FILE_FIXED, map_flags))
+    if (DYNAMO_OPTION(heap_in_lower_4GB) &&
+        !TESTANY(MAP_FILE_FIXED | MAP_FILE_APP, map_flags))
         flags |= MAP_32BIT;
 #endif
     /* Allows memory request instead of mapping a file,
@@ -4393,6 +4656,7 @@ os_create_memory_file(const char *name, size_t size)
     }
     fd = priv_fd;
     fd_mark_close_on_exec(fd); /* We could use MFD_CLOEXEC for memfd_create. */
+    fd_table_add(fd, 0 /*keep across fork*/);
     return fd;
 #else
     ASSERT_NOT_IMPLEMENTED(false && "i#3556 NYI for Mac");
@@ -4412,6 +4676,7 @@ os_delete_memory_file(const char *name, file_t fd)
     os_get_memory_file_shm_path(name, path, BUFFER_SIZE_ELEMENTS(path));
     NULL_TERMINATE_BUFFER(path);
     os_delete_file(path);
+    fd_table_remove(fd);
     close_syscall(fd);
 #else
     ASSERT_NOT_IMPLEMENTED(false && "i#3556 NYI for Mac");
@@ -4512,7 +4777,7 @@ void
 os_syslog(syslog_event_type_t priority, uint message_id, uint substitutions_num,
           va_list args)
 {
-    int native_priority;
+    int native_priority UNUSED;
     switch (priority) {
     case SYSLOG_INFORMATION: native_priority = LOG_INFO; break;
     case SYSLOG_WARNING: native_priority = LOG_WARNING; break;
@@ -4769,7 +5034,6 @@ make_copy_on_writable(byte *pc, size_t size)
 void
 make_unwritable(byte *pc, size_t size)
 {
-    long res;
     app_pc start_page = (app_pc)PAGE_START(pc);
     size_t prot_size = (size == 0) ? PAGE_SIZE : size;
     uint prot = PROT_EXEC | PROT_READ;
@@ -4791,7 +5055,7 @@ make_unwritable(byte *pc, size_t size)
     /* inc stats before making unwritable, in case messing w/ data segment */
     STATS_INC(protection_change_calls);
     STATS_ADD(protection_change_pages, size / PAGE_SIZE);
-    res = mprotect_syscall((void *)start_page, prot_size, prot);
+    DEBUG_DECLARE(long res =) mprotect_syscall((void *)start_page, prot_size, prot);
     LOG(THREAD_GET, LOG_VMAREAS, 3, "make_unwritable: pc " PFX " -> " PFX "-" PFX "\n",
         pc, start_page, start_page + prot_size);
     ASSERT(res == 0);
@@ -4852,7 +5116,7 @@ os_normalized_sysnum(int num_raw, instr_t *gateway, dcontext_t *dcontext)
         }
     }
 #    ifdef X64
-    if (num_raw >> 24 == 0x2)
+    if (TEST(SYSCALL_NUM_MARKER_BSD, num_raw))
         return (int)(num_raw & 0xffffff); /* Drop BSD bit */
     else
         num = (int)num_raw; /* Keep Mach and Machdep bits */
@@ -4907,6 +5171,7 @@ ignorable_system_call_normalized(int num)
 #endif
     case SYS_execve:
 #ifdef LINUX
+    case SYS_clone3:
     case SYS_clone:
 #elif defined(MACOS)
     case SYS_bsdthread_create:
@@ -4943,8 +5208,12 @@ ignorable_system_call_normalized(int num)
     case SYS_rt_sigaction:
     case SYS_rt_sigprocmask:
     case SYS_rt_sigpending:
+#    ifdef SYS_rt_sigtimedwait_time64
+    case SYS_rt_sigtimedwait_time64:
+#    endif
     case SYS_rt_sigtimedwait:
     case SYS_rt_sigqueueinfo:
+    case SYS_rt_tgsigqueueinfo:
     case SYS_rt_sigsuspend:
 #    ifdef SYS_signalfd
     case SYS_signalfd:
@@ -4960,6 +5229,9 @@ ignorable_system_call_normalized(int num)
     case SYS_getitimer:
 #ifdef MACOS
     case SYS_close_nocancel:
+#endif
+#ifdef SYS_close_range
+    case SYS_close_range:
 #endif
     case SYS_close:
 #ifdef SYS_dup2
@@ -5003,12 +5275,26 @@ ignorable_system_call_normalized(int num)
     case SYS_cacheflush:
 #endif
 #if defined(LINUX)
-    /* syscalls change procsigmask */
+/* Syscalls change procsigmask */
+#    ifdef SYS_pselect6_time64
+    case SYS_pselect6_time64:
+#    endif
     case SYS_pselect6:
+#    ifdef SYS_ppoll_time64
+    case SYS_ppoll_time64:
+#    endif
     case SYS_ppoll:
     case SYS_epoll_pwait:
     /* Used as a lazy trigger. */
     case SYS_rseq:
+#endif
+#ifdef DEBUG
+#    ifdef MACOS
+    case SYS_open_nocancel:
+#    endif
+#    ifdef SYS_open
+    case SYS_open:
+#    endif
 #endif
         return false;
 #ifdef LINUX
@@ -5017,6 +5303,10 @@ ignorable_system_call_normalized(int num)
 #    endif
     case SYS_readlinkat: return !DYNAMO_OPTION(early_inject);
 #endif
+#ifdef SYS_openat2
+    case SYS_openat2:
+#endif
+    case SYS_openat: return IS_STRING_OPTION_EMPTY(xarch_root);
     default:
 #ifdef VMX86_SERVER
         if (is_vmkuw_sysnum(num))
@@ -5058,7 +5348,7 @@ sys_param_addr(dcontext_t *dcontext, int num)
     default: CLIENT_ASSERT(false, "invalid system call parameter number");
     }
 #else
-#    ifdef MACOS
+#    if defined(MACOS) && defined(X86)
     /* XXX: if we don't end up using dcontext->sys_was_int here, we could
      * make that field Linux-only.
      */
@@ -5081,16 +5371,16 @@ sys_param_addr(dcontext_t *dcontext, int num)
      *     0xffffe405  0f 34                sysenter -> %esp
      */
     switch (num) {
-    case 0: return &mc->IF_X86_ELSE(xbx, r0);
-    case 1: return &mc->IF_X86_ELSE(xcx, r1);
-    case 2: return &mc->IF_X86_ELSE(xdx, r2);
-    case 3: return &mc->IF_X86_ELSE(xsi, r3);
-    case 4: return &mc->IF_X86_ELSE(xdi, r4);
+    case 0: return &mc->IF_X86_ELSE(xbx, IF_RISCV64_ELSE(a0, r0));
+    case 1: return &mc->IF_X86_ELSE(xcx, IF_RISCV64_ELSE(a1, r1));
+    case 2: return &mc->IF_X86_ELSE(xdx, IF_RISCV64_ELSE(a2, r2));
+    case 3: return &mc->IF_X86_ELSE(xsi, IF_RISCV64_ELSE(a3, r3));
+    case 4: return &mc->IF_X86_ELSE(xdi, IF_RISCV64_ELSE(a4, r4));
     /* FIXME: do a safe_read: but what about performance?
      * See the #if 0 below, as well. */
     case 5:
         return IF_X86_ELSE((dcontext->sys_was_int ? &mc->xbp : ((reg_t *)mc->xsp)),
-                           &mc->r5);
+                           &mc->IF_RISCV64_ELSE(a5, r5));
 #    ifdef ARM
     /* AArch32 supposedly has 7 args in some cases. */
     case 6: return &mc->r6;
@@ -5124,7 +5414,12 @@ syscall_successful(priv_mcontext_t *mc, int normalized_sysnum)
          */
         return ((ptr_int_t)MCXT_SYSCALL_RES(mc) >= 0);
     } else
+#    ifdef X86
         return !TEST(EFLAGS_CF, mc->xflags);
+#    else
+        return -1;
+#    endif
+
 #else
     if (normalized_sysnum == IF_X64_ELSE(SYS_mmap, SYS_mmap2) ||
 #    if !defined(ARM) && !defined(X64)
@@ -5146,7 +5441,7 @@ set_success_return_val(dcontext_t *dcontext, reg_t val)
 {
     /* since always coming from d_r_dispatch now, only need to set mcontext */
     priv_mcontext_t *mc = get_mcontext(dcontext);
-#ifdef MACOS
+#if defined(MACOS) && defined(X86)
     /* On MacOS, success is determined by CF, except for Mach syscalls, but
      * there it doesn't hurt to set CF.
      */
@@ -5160,7 +5455,7 @@ static inline void
 set_failure_return_val(dcontext_t *dcontext, uint errno_val)
 {
     priv_mcontext_t *mc = get_mcontext(dcontext);
-#ifdef MACOS
+#if defined(MACOS) && defined(X86)
     /* On MacOS, success is determined by CF, and errno is positive */
     mc->xflags |= EFLAGS_CF;
     MCXT_SYSCALL_RES(mc) = errno_val;
@@ -5169,7 +5464,6 @@ set_failure_return_val(dcontext_t *dcontext, uint errno_val)
 #endif
 }
 
-#ifdef CLIENT_INTERFACE
 DR_API
 reg_t
 dr_syscall_get_param(void *drcontext, int param_num)
@@ -5303,19 +5597,18 @@ dr_syscall_invoke_another(void *drcontext)
                   "event");
     LOG(THREAD, LOG_SYSCALLS, 2, "invoking additional syscall on client request\n");
     dcontext->client_data->invoke_another_syscall = true;
-#    ifdef X86
+#ifdef X86
     if (get_syscall_method() == SYSCALL_METHOD_SYSENTER) {
         priv_mcontext_t *mc = get_mcontext(dcontext);
         /* restore xbp to xsp */
         mc->xbp = mc->xsp;
     }
-#    endif /* X86 */
+#endif /* X86 */
     /* for x64 we don't need to copy xcx into r10 b/c we use r10 as our param */
 }
-#endif /* CLIENT_INTERFACE */
 
 static inline bool
-is_thread_create_syscall_helper(ptr_uint_t sysnum, ptr_uint_t flags)
+is_thread_create_syscall_helper(ptr_uint_t sysnum, uint64 flags)
 {
 #ifdef MACOS
     /* XXX i#1403: we need earlier injection to intercept
@@ -5328,7 +5621,7 @@ is_thread_create_syscall_helper(ptr_uint_t sysnum, ptr_uint_t flags)
         return true;
 #    endif
 #    ifdef LINUX
-    if (sysnum == SYS_clone && TEST(CLONE_VM, flags))
+    if ((sysnum == SYS_clone || sysnum == SYS_clone3) && TEST(CLONE_VM, flags))
         return true;
 #    endif
     return false;
@@ -5336,18 +5629,40 @@ is_thread_create_syscall_helper(ptr_uint_t sysnum, ptr_uint_t flags)
 }
 
 bool
-is_thread_create_syscall(dcontext_t *dcontext)
+is_thread_create_syscall(dcontext_t *dcontext _IF_LINUX(void *maybe_clone_args))
 {
     priv_mcontext_t *mc = get_mcontext(dcontext);
-    return is_thread_create_syscall_helper(MCXT_SYSNUM_REG(mc), sys_param(dcontext, 0));
+    uint64 flags = sys_param(dcontext, 0);
+    ptr_uint_t sysnum = MCXT_SYSNUM_REG(mc);
+#ifdef LINUX
+    /* For clone3, we use flags from the clone_args that was obtained using a
+     * a safe read from the user-provided syscall args.
+     */
+    if (sysnum == SYS_clone3) {
+        ASSERT(maybe_clone_args != NULL);
+        flags = ((clone3_syscall_args_t *)maybe_clone_args)->flags;
+    }
+#endif
+    return is_thread_create_syscall_helper(sysnum, flags);
 }
+
+#ifdef LINUX
+static ptr_uint_t
+get_stored_clone3_flags(dcontext_t *dcontext)
+{
+    return ((uint64)dcontext->sys_param4 << 32) | dcontext->sys_param3;
+}
+#endif
 
 bool
 was_thread_create_syscall(dcontext_t *dcontext)
 {
-    return is_thread_create_syscall_helper(dcontext->sys_num,
-                                           /* flags in param0 */
-                                           dcontext->sys_param0);
+    uint64 flags = dcontext->sys_param0;
+#ifdef LINUX
+    if (dcontext->sys_num == SYS_clone3)
+        flags = get_stored_clone3_flags(dcontext);
+#endif
+    return is_thread_create_syscall_helper(dcontext->sys_num, flags);
 }
 
 bool
@@ -5429,15 +5744,17 @@ static const char *const env_to_propagate[] = {
     DYNAMORIO_VAR_EXECVE_LOGDIR,
     /* i#909: needed for early injection */
     DYNAMORIO_VAR_EXE_PATH,
-    /* these will only be propagated if they exist */
+    /* These will only be propagated if they exist: */
     DYNAMORIO_VAR_CONFIGDIR,
+    DYNAMORIO_VAR_AUTOINJECT,
+    DYNAMORIO_VAR_ALTINJECT,
 };
 #define NUM_ENV_TO_PROPAGATE (sizeof(env_to_propagate) / sizeof(env_to_propagate[0]))
 
 /* Called at pre-SYS_execve to append DR vars in the target process env vars list.
  * For late injection via libdrpreload, we call this for *all children, because
- * even if -no_follow_children is specified, a whitelist will still ask for takeover
- * and it's libdrpreload who checks the whitelist.
+ * even if -no_follow_children is specified, a allowlist will still ask for takeover
+ * and it's libdrpreload who checks the allowlist.
  * For -early, however, we check the config ahead of time and only call this routine
  * if we in fact want to inject.
  * XXX i#1679: these parent vs child differences bring up corner cases of which
@@ -5775,11 +6092,13 @@ handle_execve(dcontext_t *dcontext)
      * in fs/exec.c:
      *  int do_execve(char * filename, char ** argv, char ** envp, struct pt_regs * regs)
      */
-    /* We need to make sure we get injected into the new image:
+    /* We need to make sure we get injected into the new image.
+     *
+     * For legacy late injection:
      * we simply make sure LD_PRELOAD contains us, and that our directory
      * is on LD_LIBRARY_PATH (seems not to work to put absolute paths in
      * LD_PRELOAD).
-     * FIXME: this doesn't work for setuid programs
+     * (This doesn't work for setuid programs though.)
      *
      * For -follow_children we also pass the current DYNAMORIO_RUNUNDER and
      * DYNAMORIO_OPTIONS and logdir to the new image to support a simple
@@ -5794,7 +6113,7 @@ handle_execve(dcontext_t *dcontext)
      */
     char *fname;
     bool x64 = IF_X64_ELSE(true, false);
-    bool expect_to_fail = false;
+    bool expect_to_fail UNUSED = false;
     bool should_inject;
     file_t file;
     char *inject_library_path;
@@ -5911,28 +6230,28 @@ handle_execve(dcontext_t *dcontext)
         /* i#909: change the target image to libdynamorio.so */
         const char *drpath = IF_X64_ELSE(x64, !x64) ? dynamorio_library_filepath
                                                     : dynamorio_alt_arch_filepath;
-        TRY_EXCEPT(dcontext, /* try */
-                   {
-                       if (symlink_is_self_exe(argv[0])) {
-                           /* we're out of sys_param entries so we assume argv[0] == fname
-                            */
-                           dcontext->sys_param3 = (reg_t)argv;
-                           argv[0] = fname; /* XXX: handle readable but not writable! */
-                       } else
-                           dcontext->sys_param3 = 0; /* no restore in post */
-                       dcontext->sys_param4 =
-                           (reg_t)fname; /* store for restore in post */
-                       *sys_param_addr(dcontext, 0) = (reg_t)drpath;
-                       LOG(THREAD, LOG_SYSCALLS, 2, "actual execve on: %s\n",
-                           (char *)sys_param(dcontext, 0));
-                   },
-                   /* except */
-                   {
-                       dcontext->sys_param3 = 0; /* no restore in post */
-                       dcontext->sys_param4 = 0; /* no restore in post */
-                       LOG(THREAD, LOG_SYSCALLS, 2,
-                           "argv is unreadable, expect execve to fail\n");
-                   });
+        TRY_EXCEPT(
+            dcontext, /* try */
+            {
+                if (symlink_is_self_exe(argv[0])) {
+                    /* we're out of sys_param entries so we assume argv[0] == fname
+                     */
+                    dcontext->sys_param3 = (reg_t)argv;
+                    argv[0] = fname; /* XXX: handle readable but not writable! */
+                } else
+                    dcontext->sys_param3 = 0;        /* no restore in post */
+                dcontext->sys_param4 = (reg_t)fname; /* store for restore in post */
+                *sys_param_addr(dcontext, 0) = (reg_t)drpath;
+                LOG(THREAD, LOG_SYSCALLS, 2, "actual execve on: %s\n",
+                    (char *)sys_param(dcontext, 0));
+            },
+            /* except */
+            {
+                dcontext->sys_param3 = 0; /* no restore in post */
+                dcontext->sys_param4 = 0; /* no restore in post */
+                LOG(THREAD, LOG_SYSCALLS, 2,
+                    "argv is unreadable, expect execve to fail\n");
+            });
     } else {
         dcontext->sys_param3 = 0; /* no restore in post */
         dcontext->sys_param4 = 0; /* no restore in post */
@@ -6037,10 +6356,8 @@ set_stdfile_fileno(stdfile_t **stdfile, file_t file_no)
 
 /* returns whether to execute syscall */
 static bool
-handle_close_pre(dcontext_t *dcontext)
+handle_close_generic_pre(dcontext_t *dcontext, file_t fd, bool set_return_val)
 {
-    /* in fs/open.c: asmlinkage long sys_close(unsigned int fd) */
-    uint fd = (uint)sys_param(dcontext, 0);
     LOG(THREAD, LOG_SYSCALLS, 3, "syscall: close fd %d\n", fd);
 
     /* prevent app from closing our files */
@@ -6048,11 +6365,13 @@ handle_close_pre(dcontext_t *dcontext)
         SYSLOG_INTERNAL_WARNING_ONCE("app trying to close DR file(s)");
         LOG(THREAD, LOG_TOP | LOG_SYSCALLS, 1,
             "WARNING: app trying to close DR file %d!  Not allowing it.\n", fd);
-        if (DYNAMO_OPTION(fail_on_stolen_fds)) {
-            set_failure_return_val(dcontext, EBADF);
-            DODEBUG({ dcontext->expect_last_syscall_to_fail = true; });
-        } else
-            set_success_return_val(dcontext, 0);
+        if (set_return_val) {
+            if (DYNAMO_OPTION(fail_on_stolen_fds)) {
+                set_failure_return_val(dcontext, EBADF);
+                DODEBUG({ dcontext->expect_last_syscall_to_fail = true; });
+            } else
+                set_success_return_val(dcontext, 0);
+        }
         return false; /* do not execute syscall */
     }
 
@@ -6069,8 +6388,7 @@ handle_close_pre(dcontext_t *dcontext)
             "WARNING: app is closing stdout=%d - duplicating descriptor for "
             "DynamoRIO usage got %d.\n",
             fd, our_stdout);
-        if (privmod_stdout != NULL &&
-            IF_CLIENT_INTERFACE_ELSE(INTERNAL_OPTION(private_loader), false)) {
+        if (privmod_stdout != NULL && INTERNAL_OPTION(private_loader)) {
             /* update the privately loaded libc's stdout _fileno. */
             set_stdfile_fileno(privmod_stdout, our_stdout);
         }
@@ -6086,8 +6404,7 @@ handle_close_pre(dcontext_t *dcontext)
             "WARNING: app is closing stderr=%d - duplicating descriptor for "
             "DynamoRIO usage got %d.\n",
             fd, our_stderr);
-        if (privmod_stderr != NULL &&
-            IF_CLIENT_INTERFACE_ELSE(INTERNAL_OPTION(private_loader), false)) {
+        if (privmod_stderr != NULL && INTERNAL_OPTION(private_loader)) {
             /* update the privately loaded libc's stderr _fileno. */
             set_stdfile_fileno(privmod_stderr, our_stderr);
         }
@@ -6103,14 +6420,28 @@ handle_close_pre(dcontext_t *dcontext)
             "WARNING: app is closing stdin=%d - duplicating descriptor for "
             "DynamoRIO usage got %d.\n",
             fd, our_stdin);
-        if (privmod_stdin != NULL &&
-            IF_CLIENT_INTERFACE_ELSE(INTERNAL_OPTION(private_loader), false)) {
+        if (privmod_stdin != NULL && INTERNAL_OPTION(private_loader)) {
             /* update the privately loaded libc's stdout _fileno. */
             set_stdfile_fileno(privmod_stdin, our_stdin);
         }
     }
     return true;
 }
+
+static bool
+handle_close_pre(dcontext_t *dcontext)
+{
+    return handle_close_generic_pre(dcontext, (uint)sys_param(dcontext, 0),
+                                    true /*set_return_val*/);
+}
+
+#ifdef SYS_close_range
+static bool
+handle_close_range_pre(dcontext_t *dcontext, file_t fd)
+{
+    return handle_close_generic_pre(dcontext, fd, false /*set_return_val*/);
+}
+#endif
 
 /***************************************************************************/
 
@@ -6214,8 +6545,7 @@ handle_exit(dcontext_t *dcontext)
                                 sys_param(dcontext, 2), sys_param(dcontext, 3));
 }
 
-#if defined(LINUX) && defined(X86) /* XXX i#58: just until we have Mac support \
-                                    */
+#if defined(LINUX) && defined(X86) /* XXX i#58: until we have Mac support */
 static bool
 os_set_app_thread_area(dcontext_t *dcontext, our_modify_ldt_t *user_desc)
 {
@@ -6268,7 +6598,7 @@ os_set_app_thread_area(dcontext_t *dcontext, our_modify_ldt_t *user_desc)
         memcpy(&desc[i], user_desc, sizeof(*user_desc));
     }
     /* if not conflict with dr's tls, perform the syscall */
-    if (IF_CLIENT_INTERFACE_ELSE(!INTERNAL_OPTION(private_loader), true) &&
+    if (!INTERNAL_OPTION(private_loader) &&
         GDT_SELECTOR(user_desc->entry_number) != read_thread_register(SEG_TLS) &&
         GDT_SELECTOR(user_desc->entry_number) != read_thread_register(LIB_SEG_TLS))
         return false;
@@ -6450,6 +6780,38 @@ os_switch_seg_to_context(dcontext_t *dcontext, reg_id_t seg, bool to_app)
     os_thread_data_t *ostd = (os_thread_data_t *)dcontext->os_field;
     ASSERT(INTERNAL_OPTION(private_loader));
     if (to_app) {
+        /* We need to handle being called when we're already in the requested state. */
+        ptr_uint_t cur_seg = read_thread_register(LIB_SEG_TLS);
+        if ((void *)cur_seg == os_tls->app_lib_tls_base)
+            return true;
+        bool app_mem_valid = true;
+        if (os_tls->app_lib_tls_base == NULL)
+            app_mem_valid = false;
+        else {
+            uint prot;
+            bool rc = get_memory_info(os_tls->app_lib_tls_base, NULL, NULL, &prot);
+            /* Rule out a garbage value, which happens in our own test
+             * common.allasm_aarch_isa.
+             * Also rule out an unwritable region, which seems to happen on arm
+             * where at process init the thread reg points at rodata in libc
+             * until properly set to a writable mmap later.
+             */
+            if (!rc || !TESTALL(MEMPROT_READ | MEMPROT_WRITE, prot))
+                app_mem_valid = false;
+        }
+        if (!app_mem_valid) {
+            /* XXX i#1578: For pure-asm apps that do not use libc, the app may have no
+             * thread register value.  For detach we would like to write a 0 back into
+             * the thread register, but it complicates our exit code, which wants access
+             * to DR's TLS between dynamo_thread_exit_common()'s call to
+             * dynamo_thread_not_under_dynamo() and its call to
+             * set_thread_private_dcontext(NULL).  For now we just leave our privlib
+             * segment in there.  It seems rather unlikely to cause a problem: app code
+             * is unlikely to read the thread register; it's going to assume it owns it
+             * and will just blindly write to it.
+             */
+            return true;
+        }
         /* On switching to app's TLS, we need put DR's TLS base into app's TLS
          * at the same offset so it can be loaded on entering code cache.
          * Otherwise, the context switch code on entering fcache will fault on
@@ -6473,6 +6835,10 @@ os_switch_seg_to_context(dcontext_t *dcontext, reg_id_t seg, bool to_app)
             __FUNCTION__, (to_app ? "app" : "dr"), os_tls->app_lib_tls_base);
         res = write_thread_register(os_tls->app_lib_tls_base);
     } else {
+        /* We need to handle being called when we're already in the requested state. */
+        ptr_uint_t cur_seg = read_thread_register(LIB_SEG_TLS);
+        if ((void *)cur_seg == ostd->priv_lib_tls_base)
+            return true;
         /* Restore the app's TLS slot that we used for storing DR's TLS base,
          * and put DR's TLS base back to privlib's TLS slot.
          */
@@ -6495,12 +6861,179 @@ os_switch_seg_to_context(dcontext_t *dcontext, reg_id_t seg, bool to_app)
     LOG(THREAD, LOG_LOADER, 2, "%s %s: set_tls swap success=%d for thread " TIDFMT "\n",
         __FUNCTION__, to_app ? "to app" : "to DR", res, d_r_get_thread_id());
     return res;
-#elif defined(AARCH64)
+#elif defined(RISCV64)
+    /* FIXME i#3544: Not implemented */
+    ASSERT_NOT_IMPLEMENTED(false);
+    /* Marking as unused to silence -Wunused-variable. */
     (void)os_tls;
-    ASSERT_NOT_IMPLEMENTED(false); /* FIXME i#1569 */
     return false;
-#endif /* X86/ARM/AARCH64 */
+#endif /* X86/AARCHXX/RISCV64 */
 }
+
+#ifdef LINUX
+static bool
+handle_clone_pre(dcontext_t *dcontext)
+{
+    /* For the clone syscall, in /usr/src/linux/arch/i386/kernel/process.c
+     * 32-bit params: flags, newsp, ptid, tls, ctid
+     * 64-bit params: should be the same yet tls (for ARCH_SET_FS) is in r8?!?
+     *   I don't see how sys_clone gets its special args: shouldn't it
+     *   just get pt_regs as a "special system call"?
+     *   sys_clone(unsigned long clone_flags, unsigned long newsp,
+     *     void __user *parent_tid, void __user *child_tid, struct pt_regs *regs)
+     */
+    uint64_t flags;
+    /* For the clone3 syscall, DR creates its own copy of clone_args for two
+     * reasons: to ensure that the app-provided clone_args is readable
+     * without any fault, and to avoid modifying the app's clone_args in the
+     * is_thread_create_syscall case (see below).
+     */
+    clone3_syscall_args_t *dr_clone_args = NULL, *app_clone_args = NULL;
+    uint app_clone_args_size = 0;
+    if (dcontext->sys_num == SYS_clone3) {
+        if (is_clone3_enosys) {
+            /* We know that clone3 will return ENOSYS, so we skip the pre-syscall
+             * handling and fail early.
+             */
+            LOG(THREAD, LOG_SYSCALLS, 2, "\treturning ENOSYS to app for clone3\n");
+            set_failure_return_val(dcontext, ENOSYS);
+            DODEBUG({ dcontext->expect_last_syscall_to_fail = true; });
+            return false;
+        }
+        app_clone_args_size =
+            (uint)sys_param(dcontext, SYSCALL_PARAM_CLONE3_CLONE_ARGS_SIZE);
+        if (app_clone_args_size < CLONE_ARGS_SIZE_VER0) {
+            LOG(THREAD, LOG_SYSCALLS, 2, "\treturning EINVAL to app for clone3\n");
+            set_failure_return_val(dcontext, EINVAL);
+            DODEBUG({ dcontext->expect_last_syscall_to_fail = true; });
+            return false;
+        }
+        app_clone_args =
+            (clone3_syscall_args_t *)sys_param(dcontext, SYSCALL_PARAM_CLONE3_CLONE_ARGS);
+        /* Note that the struct clone_args being used by the app may have
+         * less/more fields than DR's internal struct (clone3_syscall_args_t).
+         * For creating DR's copy of the app's clone_args object, we need to
+         * allocate as much space as specified by the app in the clone3
+         * syscall's args.
+         */
+        dr_clone_args = (clone3_syscall_args_t *)heap_alloc(
+            dcontext, app_clone_args_size HEAPACCT(ACCT_OTHER));
+        if (!d_r_safe_read(app_clone_args, app_clone_args_size, dr_clone_args)) {
+            LOG(THREAD, LOG_SYSCALLS, 2, "\treturning EFAULT to app for clone3\n");
+            set_failure_return_val(dcontext, EFAULT);
+            DODEBUG({ dcontext->expect_last_syscall_to_fail = true; });
+            heap_free(dcontext, dr_clone_args, app_clone_args_size HEAPACCT(ACCT_OTHER));
+            return false;
+        }
+        flags = dr_clone_args->flags;
+
+        /* Save for post_system_call */
+        /* We need to save the pointer to the app's clone_args so that we can restore it
+         * post-syscall.
+         */
+        dcontext->sys_param0 = (reg_t)app_clone_args;
+        /* For freeing the allocated memory. */
+        dcontext->sys_param1 = (reg_t)dr_clone_args;
+        dcontext->sys_param2 = (reg_t)app_clone_args_size;
+        /* clone3 flags are 64-bit even on 32-bit systems. So we need to split them across
+         * two reg_t vars on 32-bit. We do it on 64-bit systems as well for simpler code.
+         */
+        dcontext->sys_param3 = (reg_t)(flags & CLONE3_FLAGS_4_BYTE_MASK);
+        ASSERT((flags >> 32 & ~CLONE3_FLAGS_4_BYTE_MASK) == 0);
+        dcontext->sys_param4 = (reg_t)((flags >> 32));
+        LOG(THREAD, LOG_SYSCALLS, 2,
+            "syscall: clone3 with args: flags = 0x" HEX64_FORMAT_STRING
+            ", exit_signal = 0x" HEX64_FORMAT_STRING ", stack = 0x" HEX64_FORMAT_STRING
+            ", stack_size = 0x" HEX64_FORMAT_STRING "\n",
+            dr_clone_args->flags, dr_clone_args->exit_signal, dr_clone_args->stack,
+            dr_clone_args->stack_size);
+    } else {
+        flags = (uint)sys_param(dcontext, 0);
+        /* Save for post_system_call.
+         * Unlike clone3, here the flags are 32-bit, so truncation is okay.
+         */
+        dcontext->sys_param0 = (reg_t)flags;
+        LOG(THREAD, LOG_SYSCALLS, 2,
+            "syscall: clone with args: flags = " PFX ", stack = " PFX
+            ", tid_field_parent = " PFX ", tid_field_child = " PFX ", thread_ptr = " PFX
+            "\n",
+            sys_param(dcontext, 0), sys_param(dcontext, 1), sys_param(dcontext, 2),
+            sys_param(dcontext, 3), sys_param(dcontext, 4));
+    }
+    handle_clone(dcontext, flags);
+    if ((flags & CLONE_VM) == 0) {
+        LOG(THREAD, LOG_SYSCALLS, 1, "\tWARNING: CLONE_VM not set!\n");
+    }
+
+    /* i#1010: If we have private fds open (usually logfiles), we should
+     * clean those up before they get reused by a new thread.
+     * XXX: Ideally we'd do this in fd_table_add(), but we can't acquire
+     * thread_initexit_lock there.
+     */
+    cleanup_after_vfork_execve(dcontext);
+
+    /* For thread creation clone syscalls a clone_record_t structure
+     * containing the pc after the app's syscall instr and other data
+     * (see i#27) is placed at the bottom of the dstack (which is allocated
+     * by create_clone_record() - it also saves app stack and switches
+     * to dstack).  xref i#149/PR 403015.
+     * Note: This must be done after sys_param0 is set.
+     */
+    if (is_thread_create_syscall(dcontext, dr_clone_args)) {
+        if (dcontext->sys_num == SYS_clone3) {
+            /* create_clone_record modifies some fields in clone_args for the
+             * clone3 syscall. Instead of reusing the app's copy of
+             * clone_args and modifying it, we choose to use our own copy.
+             * Under CLONE_VM, the parent and child threads have a pointer to
+             * the same app clone_args. By using our own copy of clone_args
+             * for the syscall, we obviate the need to restore the modified
+             * fields in the app's copy after the syscall in either the parent
+             * or the child thread, which can be racy under CLONE_VM as the
+             * parent and/or child threads may need to access/modify it. By
+             * using a copy instead, both parent and child threads only
+             * need to restore their own SYSCALL_PARAM_CLONE3_CLONE_ARGS reg
+             * to the pointer to the app's clone_args. It is saved in the
+             * clone record for the child thread, and in sys_param0 for the
+             * parent thread. The DR copy of clone_args is freed by the parent
+             * thread in the post-syscall handling of clone3; as it is used
+             * only by the parent thread, there is no use-after-free danger here.
+             */
+            ASSERT(app_clone_args != NULL && dr_clone_args != NULL);
+            *sys_param_addr(dcontext, SYSCALL_PARAM_CLONE3_CLONE_ARGS) =
+                (reg_t)dr_clone_args;
+            /* The pointer to the app's clone_args was saved in sys_param0 above. */
+            create_clone_record(dcontext, NULL, dr_clone_args, app_clone_args);
+        } else {
+            /* We replace the app-provided stack pointer with our own stack
+             * pointer in create_clone_record. Save the original pointer so
+             * that we can restore it post-syscall in the parent. The same is
+             * restored in the child in restore_clone_param_from_clone_record.
+             */
+            dcontext->sys_param1 = sys_param(dcontext, SYSCALL_PARAM_CLONE_STACK);
+            create_clone_record(dcontext,
+                                sys_param_addr(dcontext, SYSCALL_PARAM_CLONE_STACK), NULL,
+                                NULL);
+        }
+        os_clone_pre(dcontext);
+        os_new_thread_pre();
+    } else {
+        /* This is really a fork. */
+        if (dcontext->sys_num == SYS_clone3) {
+            /* We free this memory before the actual fork, to avoid having to free
+             * it in the parent *and* the child later.
+             */
+            ASSERT(app_clone_args_size == (uint)dcontext->sys_param2);
+            ASSERT(dr_clone_args == (clone3_syscall_args_t *)dcontext->sys_param1);
+            heap_free(dcontext, dr_clone_args, app_clone_args_size HEAPACCT(ACCT_OTHER));
+            /* We do not need these anymore for the fork case. */
+            dcontext->sys_param1 = 0;
+            dcontext->sys_param2 = 0;
+        }
+        os_fork_pre(dcontext);
+    }
+    return true;
+}
+#endif
 
 /* System call interception: put any special handling here
  * Arguments come from the pusha right before the call
@@ -6558,11 +7091,12 @@ pre_system_call(dcontext_t *dcontext)
         /* not using SAFE_READ due to performance concerns (we do this for
          * every single system call on systems where we can't hook vsyscall!)
          */
-        TRY_EXCEPT(dcontext, /* try */ { mc->xbp = *(reg_t *)mc->xsp; }, /* except */
-                   {
-                       ASSERT_NOT_REACHED();
-                       mc->xbp = 0;
-                   });
+        TRY_EXCEPT(
+            dcontext, /* try */ { mc->xbp = *(reg_t *)mc->xsp; }, /* except */
+            {
+                ASSERT_NOT_REACHED();
+                mc->xbp = 0;
+            });
     }
 #endif
 
@@ -6769,7 +7303,7 @@ pre_system_call(dcontext_t *dcontext)
         size_t len = (size_t)sys_param(dcontext, 1);
         uint prot = (uint)sys_param(dcontext, 2);
         uint old_memprot = MEMPROT_NONE, new_memprot;
-        bool exists = true;
+        bool exists UNUSED = true;
         /* save params in case an undo is needed in post_system_call */
         dcontext->sys_param0 = (reg_t)addr;
         dcontext->sys_param1 = len;
@@ -6860,51 +7394,8 @@ pre_system_call(dcontext_t *dcontext)
     /* SPAWNING */
 
 #ifdef LINUX
-    case SYS_clone: {
-        /* in /usr/src/linux/arch/i386/kernel/process.c
-         * 32-bit params: flags, newsp, ptid, tls, ctid
-         * 64-bit params: should be the same yet tls (for ARCH_SET_FS) is in r8?!?
-         *   I don't see how sys_clone gets its special args: shouldn't it
-         *   just get pt_regs as a "special system call"?
-         *   sys_clone(unsigned long clone_flags, unsigned long newsp,
-         *     void __user *parent_tid, void __user *child_tid, struct pt_regs *regs)
-         */
-        uint flags = (uint)sys_param(dcontext, 0);
-        LOG(THREAD, LOG_SYSCALLS, 2, "syscall: clone with flags = " PFX "\n", flags);
-        LOG(THREAD, LOG_SYSCALLS, 2,
-            "args: " PFX ", " PFX ", " PFX ", " PFX ", " PFX "\n", sys_param(dcontext, 0),
-            sys_param(dcontext, 1), sys_param(dcontext, 2), sys_param(dcontext, 3),
-            sys_param(dcontext, 4));
-        handle_clone(dcontext, flags);
-        if ((flags & CLONE_VM) == 0) {
-            LOG(THREAD, LOG_SYSCALLS, 1, "\tWARNING: CLONE_VM not set!\n");
-        }
-        /* save for post_system_call */
-        dcontext->sys_param0 = (reg_t)flags;
-
-        /* i#1010: If we have private fds open (usually logfiles), we should
-         * clean those up before they get reused by a new thread.
-         * XXX: Ideally we'd do this in fd_table_add(), but we can't acquire
-         * thread_initexit_lock there.
-         */
-        cleanup_after_vfork_execve(dcontext);
-
-        /* For thread creation clone syscalls a clone_record_t structure
-         * containing the pc after the app's syscall instr and other data
-         * (see i#27) is placed at the bottom of the dstack (which is allocated
-         * by create_clone_record() - it also saves app stack and switches
-         * to dstack).  xref i#149/PR 403015.
-         * Note: This must be done after sys_param0 is set.
-         */
-        if (is_thread_create_syscall(dcontext)) {
-            create_clone_record(dcontext,
-                                sys_param_addr(dcontext, SYSCALL_PARAM_CLONE_STACK));
-            os_clone_pre(dcontext);
-            os_new_thread_pre();
-        } else /* This is really a fork. */
-            os_fork_pre(dcontext);
-        break;
-    }
+    case SYS_clone3:
+    case SYS_clone: execute_syscall = handle_clone_pre(dcontext); break;
 #elif defined(MACOS)
     case SYS_bsdthread_create: {
         /* XXX i#1403: we need earlier injection to intercept
@@ -6948,12 +7439,13 @@ pre_system_call(dcontext_t *dcontext)
         /* vfork has the same needs as clone.  Pass info via a clone_record_t
          * structure to child.  See SYS_clone for info about i#149/PR 403015.
          */
-        IF_LINUX(ASSERT(is_thread_create_syscall(dcontext)));
+        IF_LINUX(ASSERT(is_thread_create_syscall(dcontext, NULL)));
         dcontext->sys_param1 = mc->xsp; /* for restoring in parent */
 #    ifdef MACOS
         create_clone_record(dcontext, (reg_t *)&mc->xsp, NULL, NULL);
 #    else
-        create_clone_record(dcontext, (reg_t *)&mc->xsp /*child uses parent sp*/);
+        create_clone_record(dcontext, (reg_t *)&mc->xsp /*child uses parent sp*/, NULL,
+                            NULL);
 #    endif
         os_clone_pre(dcontext);
         os_new_thread_pre();
@@ -7098,16 +7590,26 @@ pre_system_call(dcontext_t *dcontext)
              size_t sigsetsize)
          */
         /* we also need access to the params in post_system_call */
+        uint error_code = 0;
         dcontext->sys_param0 = sys_param(dcontext, 0);
         dcontext->sys_param1 = sys_param(dcontext, 1);
         dcontext->sys_param2 = sys_param(dcontext, 2);
-        dcontext->sys_param3 = sys_param(dcontext, 3);
+        /* SYS_sigprocmask on MacOS does not have a size arg. So we use the
+         * kernel_sigset_t size instead.
+         */
+        size_t sigsetsize =
+            (size_t)IF_MACOS_ELSE(sizeof(kernel_sigset_t), sys_param(dcontext, 3));
+        dcontext->sys_param3 = (reg_t)sigsetsize;
         execute_syscall = handle_sigprocmask(dcontext, (int)sys_param(dcontext, 0),
                                              (kernel_sigset_t *)sys_param(dcontext, 1),
                                              (kernel_sigset_t *)sys_param(dcontext, 2),
-                                             (size_t)sys_param(dcontext, 3));
-        if (!execute_syscall)
-            set_success_return_val(dcontext, 0);
+                                             sigsetsize, &error_code);
+        if (!execute_syscall) {
+            if (error_code == 0)
+                set_success_return_val(dcontext, 0);
+            else
+                set_failure_return_val(dcontext, error_code);
+        }
         break;
     }
 #ifdef MACOS
@@ -7264,8 +7766,12 @@ pre_system_call(dcontext_t *dcontext)
 #    endif
 #endif
 #ifdef LINUX
+#    ifdef SYS_rt_sigtimedwait_time64
+    case SYS_rt_sigtimedwait_time64: /* 421 */
+#    endif
     case SYS_rt_sigtimedwait: /* 177 */
     case SYS_rt_sigqueueinfo: /* 178 */
+    case SYS_rt_tgsigqueueinfo:
 #endif
     case IF_MACOS_ELSE(SYS_sigpending, SYS_rt_sigpending): { /* 176 */
         /* FIXME i#92: handle all of these syscalls! */
@@ -7276,6 +7782,9 @@ pre_system_call(dcontext_t *dcontext)
         break;
     }
 #ifdef LINUX
+#    ifdef SYS_ppoll_time64
+    case SYS_ppoll_time64:
+#    endif
     case SYS_ppoll: {
         kernel_sigset_t *sigmask = (kernel_sigset_t *)sys_param(dcontext, 3);
         dcontext->sys_param3 = (reg_t)sigmask;
@@ -7307,6 +7816,9 @@ pre_system_call(dcontext_t *dcontext)
         }
         break;
     }
+#    ifdef SYS_pselect6_time64
+    case SYS_pselect6_time64:
+#    endif
     case SYS_pselect6: {
         typedef struct {
             kernel_sigset_t *sigmask;
@@ -7398,6 +7910,76 @@ pre_system_call(dcontext_t *dcontext)
 #ifdef MACOS
     case SYS_close_nocancel:
 #endif
+#ifdef SYS_close_range
+    case SYS_close_range: {
+        /* client.file_io indeed tests this for all arch, but it hasn't yet been
+         * run on an AArchXX machine that has close_range available.
+         */
+        IF_AARCHXX(ASSERT_NOT_TESTED());
+        uint first_fd = sys_param(dcontext, 0), last_fd = sys_param(dcontext, 1);
+        uint flags = sys_param(dcontext, 2);
+        bool is_cloexec = TEST(CLOSE_RANGE_CLOEXEC, flags);
+        if (is_cloexec) {
+            /* client.file_io has a test for CLOSE_RANGE_CLOEXEC, but it hasn't been
+             * verified on a system with kernel version >= 5.11 yet.
+             */
+            ASSERT_NOT_TESTED();
+        }
+        /* We do not let the app execute their own close_range ever. Instead we
+         * make multiple close_range syscalls ourselves, one for each contiguous
+         * sub-range of non-DR-private fds in [first, last].
+         */
+        execute_syscall = false;
+        if (first_fd > last_fd) {
+            set_failure_return_val(dcontext, EINVAL);
+            DODEBUG({ dcontext->expect_last_syscall_to_fail = true; });
+            break;
+        }
+        uint cur_range_first_fd = 0;
+        uint cur_range_last_fd = 0;
+        bool cur_range_valid = false;
+        int ret = 0;
+        for (int i = first_fd; i <= last_fd; i++) {
+            /* Do not allow any changes to DR-owned FDs. */
+            if ((is_cloexec && fd_is_dr_owned(i)) ||
+                (!is_cloexec && !handle_close_range_pre(dcontext, i))) {
+                SYSLOG_INTERNAL_WARNING_ONCE("app trying to close private fd(s)");
+                if (cur_range_valid) {
+                    cur_range_valid = false;
+                    ret = dynamorio_syscall(SYS_close_range, 3, cur_range_first_fd,
+                                            cur_range_last_fd, flags);
+                    if (ret != 0)
+                        break;
+                }
+            } else {
+#    ifdef LINUX
+                if (!is_cloexec) {
+                    signal_handle_close(dcontext, i);
+                }
+#    endif
+                if (cur_range_valid) {
+                    ASSERT(cur_range_last_fd == i - 1);
+                    cur_range_last_fd = i;
+                } else {
+                    cur_range_first_fd = i;
+                    cur_range_last_fd = i;
+                    cur_range_valid = true;
+                }
+            }
+        }
+        if (cur_range_valid) {
+            ret = dynamorio_syscall(SYS_close_range, 3, cur_range_first_fd,
+                                    cur_range_last_fd, flags);
+        }
+        if (ret != 0) {
+            set_failure_return_val(dcontext, ret);
+            DODEBUG({ dcontext->expect_last_syscall_to_fail = true; });
+        } else {
+            set_success_return_val(dcontext, 0);
+        }
+        break;
+    }
+#endif
     case SYS_close: {
         execute_syscall = handle_close_pre(dcontext);
 #ifdef LINUX
@@ -7406,25 +7988,28 @@ pre_system_call(dcontext_t *dcontext)
 #endif
         break;
     }
-
-#ifdef SYS_dup2
+#if defined(SYS_dup2) || defined(SYS_dup3)
+#    ifdef SYS_dup3
+    case SYS_dup3:
+#    endif
+#    ifdef SYS_dup2
     case SYS_dup2:
-        IF_LINUX(case SYS_dup3:)
-        {
-            file_t newfd = (file_t)sys_param(dcontext, 1);
-            if (fd_is_dr_owned(newfd) || fd_is_in_private_range(newfd)) {
-                SYSLOG_INTERNAL_WARNING_ONCE("app trying to dup-close DR file(s)");
-                LOG(THREAD, LOG_TOP | LOG_SYSCALLS, 1,
-                    "WARNING: app trying to dup2/dup3 to %d.  Disallowing.\n", newfd);
-                if (DYNAMO_OPTION(fail_on_stolen_fds)) {
-                    set_failure_return_val(dcontext, EBADF);
-                    DODEBUG({ dcontext->expect_last_syscall_to_fail = true; });
-                } else
-                    set_success_return_val(dcontext, 0);
-                execute_syscall = false;
-            }
-            break;
+#    endif
+    {
+        file_t newfd = (file_t)sys_param(dcontext, 1);
+        if (fd_is_dr_owned(newfd) || fd_is_in_private_range(newfd)) {
+            SYSLOG_INTERNAL_WARNING_ONCE("app trying to dup-close DR file(s)");
+            LOG(THREAD, LOG_TOP | LOG_SYSCALLS, 1,
+                "WARNING: app trying to dup2/dup3 to %d.  Disallowing.\n", newfd);
+            if (DYNAMO_OPTION(fail_on_stolen_fds)) {
+                set_failure_return_val(dcontext, EBADF);
+                DODEBUG({ dcontext->expect_last_syscall_to_fail = true; });
+            } else
+                set_success_return_val(dcontext, 0);
+            execute_syscall = false;
         }
+        break;
+    }
 #endif
 
 #ifdef MACOS
@@ -7639,7 +8224,9 @@ pre_system_call(dcontext_t *dcontext)
                                      * use synch to ensure other threads see the
                                      * new code.
                                      */
-                                    false /*don't force synchall*/);
+                                    false /*don't force synchall*/,
+                                    NULL /*flush_completion_callback*/,
+                                    NULL /*user_data*/);
         break;
     }
 #    endif /* ARM */
@@ -7658,7 +8245,34 @@ pre_system_call(dcontext_t *dcontext)
     }
 #    endif
 #endif
-
+#ifdef SYS_openat2
+    case SYS_openat2:
+#endif
+    case SYS_openat: {
+        /* XXX: For completeness we might want to replace paths for SYS_open and
+         * possibly others, but SYS_openat is all we need on modern systems so we
+         * limit syscall overhead to this single point for now.
+         */
+        dcontext->sys_param0 = 0;
+        dcontext->sys_param1 = sys_param(dcontext, 1);
+        const char *path = (const char *)dcontext->sys_param1;
+        if (!IS_STRING_OPTION_EMPTY(xarch_root) && !os_file_exists(path, false)) {
+            char *buf = heap_alloc(dcontext, MAXIMUM_PATH HEAPACCT(ACCT_OTHER));
+            string_option_read_lock();
+            snprintf(buf, MAXIMUM_PATH, "%s/%s", DYNAMO_OPTION(xarch_root), path);
+            buf[MAXIMUM_PATH - 1] = '\0';
+            string_option_read_unlock();
+            if (os_file_exists(buf, false)) {
+                LOG(THREAD, LOG_SYSCALLS, 2, "SYS_openat: replacing |%s| with |%s|\n",
+                    path, buf);
+                set_syscall_param(dcontext, 1, (reg_t)buf);
+                /* Save for freeing in post. */
+                dcontext->sys_param0 = (reg_t)buf;
+            } else
+                heap_free(dcontext, buf, MAXIMUM_PATH HEAPACCT(ACCT_OTHER));
+        }
+        break;
+    }
 #ifdef LINUX
     case SYS_rseq:
         LOG(THREAD, LOG_VMAREAS | LOG_SYSCALLS, 2, "syscall: rseq " PFX " %d %d %d\n",
@@ -7673,7 +8287,6 @@ pre_system_call(dcontext_t *dcontext)
         }
         break;
 #endif
-
     default: {
 #ifdef VMX86_SERVER
         if (is_vmkuw_sysnum(dcontext->sys_num)) {
@@ -7769,20 +8382,30 @@ mmap_check_for_module_overlap(app_pc base, size_t size, bool readable, uint64 in
                  * disk space, e.g. /usr/lib/httpd/modules/mod_auth_anon.so.  When
                  * such a module is mapped in, the os maps the same disk page twice,
                  * one readonly and one copy-on-write (see pg.  96, Sec 4.4 from
-                 * Linkers and Loaders by John R.  Levine).  This makes the data
-                 * section also satisfy the elf_header check above.  So, if the new
-                 * mmap overlaps an elf_area and it is also a header, then make sure
-                 * the previous page (correcting for alignment) is also a elf_header.
-                 * Note, if it is a header of a different module, then we'll not have
-                 * an overlap, so we will not hit this case.
+                 * Linkers and Loaders by John R.  Levine). It also possible for
+                 * such small modules to have multiple LOAD data segments. Since all
+                 * these segments are mapped from a single disk page they will all have an
+                 * elf_header satisfying the check above. So, if the new mmap overlaps an
+                 * elf_area and it is also a header, then make sure the offsets (from the
+                 * beginning of the backing file) of all the segments up to the currect
+                 * one are within the page size. Note, if it is a header of a different
+                 * module, then we'll not have an overlap, so we will not hit this case.
                  */
-                ASSERT_CURIOSITY(
-                    ma->start + ma->os_data.alignment ==
-                    base
-                        /* On Mac we walk the dyld module list before the
-                         * address space, so we often hit modules we already
-                         * know about. */
-                        IF_MACOS(|| !dynamo_initialized && ma->start == base));
+                bool cur_seg_found = false;
+                int seg_id = 0;
+                while (seg_id < ma->os_data.num_segments &&
+                       ma->os_data.segments[seg_id].start <= base) {
+                    cur_seg_found = ma->os_data.segments[seg_id].start == base;
+                    ASSERT_CURIOSITY(
+                        ma->os_data.segments[seg_id].offset <
+                        PAGE_SIZE
+                            /* On Mac we walk the dyld module list before the
+                             * address space, so we often hit modules we already
+                             * know about. */
+                            IF_MACOS(|| !dynamo_initialized && ma->start == base));
+                    ++seg_id;
+                }
+                ASSERT_CURIOSITY(cur_seg_found);
             }
         });
     }
@@ -8128,8 +8751,10 @@ post_system_call(dcontext_t *dcontext)
         || sysnum ==
             SYS_fork
 #endif
-                IF_LINUX(
-                    || (sysnum == SYS_clone && !TEST(CLONE_VM, dcontext->sys_param0)))) {
+                IF_LINUX(||
+                         (sysnum == SYS_clone && !TEST(CLONE_VM, dcontext->sys_param0)) ||
+                         (sysnum == SYS_clone3 &&
+                          !TEST(CLONE_VM, get_stored_clone3_flags(dcontext))))) {
         if (result == 0) {
             /* we're the child */
             thread_id_t child = get_sys_thread_id();
@@ -8411,19 +9036,47 @@ post_system_call(dcontext_t *dcontext)
     /* SPAWNING -- fork mostly handled above */
 
 #ifdef LINUX
+    case SYS_clone3:
     case SYS_clone: {
         /* in /usr/src/linux/arch/i386/kernel/process.c */
         LOG(THREAD, LOG_SYSCALLS, 2, "syscall: clone returned " PFX "\n",
             MCXT_SYSCALL_RES(mc));
+        /* TODO i#5221: Handle clone3 returning errors other than ENOSYS. */
         /* We switch the lib tls segment back to dr's privlib segment.
          * Please refer to comment on os_switch_lib_tls.
          * It is only called in parent thread.
          * The child thread's tls setup is done in os_tls_app_seg_init.
          */
         if (was_thread_create_syscall(dcontext)) {
-            if (IF_CLIENT_INTERFACE_ELSE(INTERNAL_OPTION(private_loader), false))
+            if (INTERNAL_OPTION(private_loader))
                 os_switch_lib_tls(dcontext, false /*to dr*/);
             /* i#2089: we already restored the DR tls in os_clone_post() */
+
+            if (sysnum == SYS_clone3) {
+                /* Free DR's copy of clone_args and restore the pointer to the
+                 * app's copy in the SYSCALL_PARAM_CLONE3_CLONE_ARGS reg.
+                 * sys_param1 contains the pointer to DR's clone_args, and
+                 * sys_param0 contains the pointer to the app's original
+                 * clone_args.
+                 */
+#    ifdef X86
+                ASSERT(sys_param(dcontext, SYSCALL_PARAM_CLONE3_CLONE_ARGS) ==
+                       dcontext->sys_param1);
+                set_syscall_param(dcontext, SYSCALL_PARAM_CLONE3_CLONE_ARGS,
+                                  dcontext->sys_param0);
+#    else
+                /* On AArchXX r0 is used to pass the first arg to the syscall as well as
+                 * to hold its return value. As the clone_args pointer isn't available
+                 * post-syscall natively anyway, there's no need to restore here.
+                 */
+#    endif
+                uint app_clone_args_size = (uint)dcontext->sys_param2;
+                heap_free(dcontext, (clone3_syscall_args_t *)dcontext->sys_param1,
+                          app_clone_args_size HEAPACCT(ACCT_OTHER));
+            } else if (sysnum == SYS_clone) {
+                set_syscall_param(dcontext, SYSCALL_PARAM_CLONE_STACK,
+                                  dcontext->sys_param1);
+            }
         }
         break;
     }
@@ -8461,7 +9114,7 @@ post_system_call(dcontext_t *dcontext)
              * It is only called in parent thread.
              * The child thread's tls setup is done in os_tls_app_seg_init.
              */
-            if (IF_CLIENT_INTERFACE_ELSE(INTERNAL_OPTION(private_loader), false)) {
+            if (INTERNAL_OPTION(private_loader)) {
                 os_switch_lib_tls(dcontext, false /*to dr*/);
             }
             /* i#2089: we already restored the DR tls in os_clone_post() */
@@ -8528,9 +9181,12 @@ post_system_call(dcontext_t *dcontext)
              size_t sigsetsize)
          */
         /* FIXME i#148: Handle syscall failure. */
-        handle_post_sigprocmask(
+        int status = handle_post_sigprocmask(
             dcontext, (int)dcontext->sys_param0, (kernel_sigset_t *)dcontext->sys_param1,
             (kernel_sigset_t *)dcontext->sys_param2, (size_t)dcontext->sys_param3);
+        if (status != 0) {
+            set_failure_return_val(dcontext, status);
+        }
         break;
     }
 #if defined(LINUX) && !defined(X64)
@@ -8567,6 +9223,9 @@ post_system_call(dcontext_t *dcontext)
     }
 #endif
 #ifdef LINUX
+#    ifdef SYS_ppoll_time64
+    case SYS_ppoll_time64:
+#    endif
     case SYS_ppoll: {
         if (dcontext->sys_param3 == (reg_t)NULL)
             break;
@@ -8574,6 +9233,9 @@ post_system_call(dcontext_t *dcontext)
         set_syscall_param(dcontext, 3, dcontext->sys_param3);
         break;
     }
+#    ifdef SYS_pselect6_time64
+    case SYS_pselect6_time64:
+#    endif
     case SYS_pselect6: {
         if (dcontext->sys_param4 == (reg_t)NULL)
             break;
@@ -8696,16 +9358,22 @@ post_system_call(dcontext_t *dcontext)
             }
         }
         break;
-
+#    ifdef SYS_openat2
+    case SYS_openat2:
+#    endif
+    case SYS_openat:
+        if (dcontext->sys_param0 != 0) {
+            heap_free(dcontext, (void *)dcontext->sys_param0,
+                      MAXIMUM_PATH HEAPACCT(ACCT_OTHER));
+        }
+        break;
     case SYS_rseq:
         /* Lazy rseq handling. */
         if (success) {
             rseq_process_syscall(dcontext);
-            rseq_locate_rseq_regions();
         }
         break;
 #endif
-
     default:
 #ifdef VMX86_SERVER
         if (is_vmkuw_sysnum(sysnum)) {
@@ -8736,7 +9404,6 @@ post_system_call(dcontext_t *dcontext)
 
 exit_post_system_call:
 
-#ifdef CLIENT_INTERFACE
     /* The instrument_post_syscall should be called after DR finishes all
      * its operations, since DR needs to know the real syscall results,
      * and any changes made by the client are simply to fool the app.
@@ -8745,7 +9412,6 @@ exit_post_system_call:
      */
     /* after restore of xbp so client sees it as though was sysenter */
     instrument_post_syscall(dcontext, sysnum);
-#endif
 
     dcontext->whereami = old_whereami;
 }
@@ -8784,15 +9450,14 @@ extern int dynamorio_so_start, dynamorio_so_end;
 static void
 get_dynamo_library_bounds(void)
 {
+    if (dynamorio_library_filepath[0] != '\0') /* Already cached. */
+        return;
     /* Note that we're not counting DYNAMORIO_PRELOAD_NAME as a DR area, to match
      * Windows, so we should unload it like we do there. The other reason not to
      * count it is so is_in_dynamo_dll() can be the only exception to the
      * never-execute-from-DR-areas list rule
      */
-    int res;
     app_pc check_start, check_end;
-    char *libdir;
-    const char *dynamorio_libname = NULL;
     bool do_memquery = true;
 #ifdef STATIC_LIBRARY
 #    ifdef LINUX
@@ -8843,11 +9508,11 @@ get_dynamo_library_bounds(void)
 #endif /* STATIC_LIBRARY */
 
     if (do_memquery) {
-        static char dynamorio_libname_buf[MAXIMUM_PATH];
-        res = memquery_library_bounds(
-            NULL, &check_start, &check_end, dynamorio_library_path,
-            BUFFER_SIZE_ELEMENTS(dynamorio_library_path), dynamorio_libname_buf,
-            BUFFER_SIZE_ELEMENTS(dynamorio_libname_buf));
+        DEBUG_DECLARE(int res =)
+        memquery_library_bounds(NULL, &check_start, &check_end, dynamorio_library_path,
+                                BUFFER_SIZE_ELEMENTS(dynamorio_library_path),
+                                dynamorio_libname_buf,
+                                BUFFER_SIZE_ELEMENTS(dynamorio_libname_buf));
         ASSERT(res > 0);
 #ifndef STATIC_LIBRARY
         dynamorio_libname = IF_UNIT_TEST_ELSE(UNIT_TEST_EXE_NAME, dynamorio_libname_buf);
@@ -8875,29 +9540,67 @@ get_dynamo_library_bounds(void)
     LOG(GLOBAL, LOG_VMAREAS, 1, "DR library bounds: " PFX " to " PFX "\n",
         dynamo_dll_start, dynamo_dll_end);
 
-    /* Issue 20: we need the path to the alt arch */
-    strncpy(dynamorio_alt_arch_path, dynamorio_library_path,
-            BUFFER_SIZE_ELEMENTS(dynamorio_alt_arch_path));
-    /* Assumption: libdir name is not repeated elsewhere in path */
-    libdir = strstr(dynamorio_alt_arch_path, IF_X64_ELSE(DR_LIBDIR_X64, DR_LIBDIR_X86));
-    if (libdir != NULL) {
-        const char *newdir = IF_X64_ELSE(DR_LIBDIR_X86, DR_LIBDIR_X64);
-        /* do NOT place the NULL */
-        strncpy(libdir, newdir, strlen(newdir));
-    } else {
-        SYSLOG_INTERNAL_WARNING("unable to determine lib path for cross-arch execve");
-    }
-    NULL_TERMINATE_BUFFER(dynamorio_alt_arch_path);
-    LOG(GLOBAL, LOG_VMAREAS, 1, PRODUCT_NAME " alt arch path: %s\n",
-        dynamorio_alt_arch_path);
-    snprintf(dynamorio_alt_arch_filepath,
-             BUFFER_SIZE_ELEMENTS(dynamorio_alt_arch_filepath), "%s%s",
-             dynamorio_alt_arch_path, dynamorio_libname);
-    NULL_TERMINATE_BUFFER(dynamorio_alt_arch_filepath);
-
     if (dynamo_dll_start == NULL || dynamo_dll_end == NULL) {
         REPORT_FATAL_ERROR_AND_EXIT(FAILED_TO_FIND_DR_BOUNDS, 2, get_application_name(),
                                     get_application_pid());
+    }
+}
+
+/* Determines and caches the alternative-bitwidth libdynamorio path.
+ * Assumed to be called at single-threaded initialization time as it sets
+ * global buffers.
+ * get_dynamo_library_bounds() must be called first.
+ */
+static void
+get_alt_dynamo_library_bounds(void)
+{
+    if (dynamorio_alt_arch_filepath[0] != '\0') /* Already cached. */
+        return;
+    /* Set by get_dynamo_library_bounds(). */
+    ASSERT(dynamorio_library_path[0] != '\0');
+    ASSERT(d_r_config_initialized());
+
+    const char *config_alt_path = get_config_val(DYNAMORIO_VAR_ALTINJECT);
+    if (config_alt_path != NULL && config_alt_path[0] != '\0') {
+        strncpy(dynamorio_alt_arch_filepath, config_alt_path,
+                BUFFER_SIZE_ELEMENTS(dynamorio_alt_arch_filepath));
+        NULL_TERMINATE_BUFFER(dynamorio_alt_arch_filepath);
+        /* We don't really need just the dir (used for the old LD_PRELOAD) but
+         * we compute it for the legacy code.
+         */
+        const char *sep = strrchr(dynamorio_alt_arch_filepath, '/');
+        if (sep != NULL) {
+            strncpy(dynamorio_alt_arch_path, dynamorio_alt_arch_filepath,
+                    sep - dynamorio_alt_arch_filepath);
+            NULL_TERMINATE_BUFFER(dynamorio_alt_arch_path);
+        }
+        LOG(GLOBAL, LOG_VMAREAS, 1, PRODUCT_NAME " alt arch filepath: %s\n",
+            dynamorio_alt_arch_filepath);
+        LOG(GLOBAL, LOG_VMAREAS, 1, PRODUCT_NAME " alt arch path: %s\n",
+            dynamorio_alt_arch_path);
+    } else {
+        /* Construct a path under assumptions of build-time path names. */
+        strncpy(dynamorio_alt_arch_path, dynamorio_library_path,
+                BUFFER_SIZE_ELEMENTS(dynamorio_alt_arch_path));
+        /* Assumption: libdir name is not repeated elsewhere in path */
+        char *libdir =
+            strstr(dynamorio_alt_arch_path, IF_X64_ELSE(DR_LIBDIR_X64, DR_LIBDIR_X86));
+        if (libdir != NULL) {
+            const char *newdir = IF_X64_ELSE(DR_LIBDIR_X86, DR_LIBDIR_X64);
+            /* do NOT place the NULL */
+            strncpy(libdir, newdir, strlen(newdir));
+        } else {
+            SYSLOG_INTERNAL_WARNING("unable to determine lib path for cross-arch execve");
+        }
+        NULL_TERMINATE_BUFFER(dynamorio_alt_arch_path);
+        LOG(GLOBAL, LOG_VMAREAS, 1, PRODUCT_NAME " alt arch path: %s\n",
+            dynamorio_alt_arch_path);
+        snprintf(dynamorio_alt_arch_filepath,
+                 BUFFER_SIZE_ELEMENTS(dynamorio_alt_arch_filepath), "%s%s",
+                 dynamorio_alt_arch_path, dynamorio_libname);
+        NULL_TERMINATE_BUFFER(dynamorio_alt_arch_filepath);
+        LOG(GLOBAL, LOG_VMAREAS, 1, PRODUCT_NAME " alt arch filepath: %s\n",
+            dynamorio_alt_arch_filepath);
     }
 }
 
@@ -9153,7 +9856,7 @@ os_walk_address_space(memquery_iter_t *iter, bool add_modules)
         bool skip = dynamo_vm_area_overlap(iter->vm_start, iter->vm_end) &&
             !is_in_dynamo_dll(iter->vm_start) /* our own text section is ok */
             /* client lib text section is ok (xref i#487) */
-            IF_CLIENT_INTERFACE(&&!is_in_client_lib(iter->vm_start));
+            && !is_in_client_lib(iter->vm_start);
         DEBUG_DECLARE(const char *map_type = "Private");
         /* we can't really tell what's a stack and what's not, but we rely on
          * our passing NULL preventing rwx regions from being added to executable
@@ -9216,7 +9919,7 @@ os_walk_address_space(memquery_iter_t *iter, bool add_modules)
             DODEBUG({ map_type = "ELF SO"; });
         } else if (TEST(MEMPROT_READ, iter->prot) &&
                    module_is_header(iter->vm_start, size)) {
-            size_t image_size = size;
+            DEBUG_DECLARE(size_t image_size = size;)
             app_pc mod_base, mod_first_end, mod_max_end;
             char *exec_match;
             bool found_exec = false;
@@ -9239,7 +9942,7 @@ os_walk_address_space(memquery_iter_t *iter, bool add_modules)
                                             true, /* i#1589: ld.so relocated .dynamic */
                                             &mod_base, &mod_first_end, &mod_max_end, NULL,
                                             NULL)) {
-                image_size = mod_max_end - mod_base;
+                DODEBUG(image_size = mod_max_end - mod_base;);
             } else {
                 ASSERT_NOT_REACHED();
             }
@@ -9563,9 +10266,8 @@ extern void
 deadlock_avoidance_unlock(mutex_t *lock, bool ownable);
 
 void
-mutex_wait_contended_lock(mutex_t *lock _IF_CLIENT_INTERFACE(priv_mcontext_t *mc))
+mutex_wait_contended_lock(mutex_t *lock, priv_mcontext_t *mc)
 {
-#ifdef CLIENT_INTERFACE
     dcontext_t *dcontext = get_thread_private_dcontext();
     bool set_client_safe_for_synch =
         ((dcontext != NULL) && IS_CLIENT_THREAD(dcontext) &&
@@ -9579,7 +10281,6 @@ mutex_wait_contended_lock(mutex_t *lock _IF_CLIENT_INTERFACE(priv_mcontext_t *mc
         ASSERT(!set_client_safe_for_synch);
         *get_mcontext(dcontext) = *mc;
     }
-#endif
 
     /* i#96/PR 295561: use futex(2) if available */
     if (ksynch_kernel_support()) {
@@ -9594,12 +10295,10 @@ mutex_wait_contended_lock(mutex_t *lock _IF_CLIENT_INTERFACE(priv_mcontext_t *mc
 #endif
         while (atomic_exchange_int(&lock->lock_requests, LOCK_CONTENDED_STATE) !=
                LOCK_FREE_STATE) {
-#ifdef CLIENT_INTERFACE
             if (set_client_safe_for_synch)
                 dcontext->client_data->client_thread_safe_for_synch = true;
             if (mc != NULL)
                 set_synch_state(dcontext, THREAD_SYNCH_VALID_MCONTEXT);
-#endif
 
                 /* Unfortunately the synch semantics are different for Linux vs Mac.
                  * We have to use lock_requests as the futex to avoid waiting if
@@ -9618,12 +10317,10 @@ mutex_wait_contended_lock(mutex_t *lock _IF_CLIENT_INTERFACE(priv_mcontext_t *mc
 #endif
             if (res != 0 && res != -EWOULDBLOCK)
                 os_thread_yield();
-#ifdef CLIENT_INTERFACE
             if (set_client_safe_for_synch)
                 dcontext->client_data->client_thread_safe_for_synch = false;
             if (mc != NULL)
                 set_synch_state(dcontext, THREAD_SYNCH_NONE);
-#endif
 
             /* we don't care whether properly woken (res==0), var mismatch
              * (res==-EWOULDBLOCK), or error: regardless, someone else
@@ -9635,20 +10332,16 @@ mutex_wait_contended_lock(mutex_t *lock _IF_CLIENT_INTERFACE(priv_mcontext_t *mc
         atomic_dec_and_test(&lock->lock_requests);
 
         while (!d_r_mutex_trylock(lock)) {
-#ifdef CLIENT_INTERFACE
             if (set_client_safe_for_synch)
                 dcontext->client_data->client_thread_safe_for_synch = true;
             if (mc != NULL)
                 set_synch_state(dcontext, THREAD_SYNCH_VALID_MCONTEXT);
-#endif
 
             os_thread_yield();
-#ifdef CLIENT_INTERFACE
             if (set_client_safe_for_synch)
                 dcontext->client_data->client_thread_safe_for_synch = false;
             if (mc != NULL)
                 set_synch_state(dcontext, THREAD_SYNCH_NONE);
-#endif
         }
 
 #ifdef DEADLOCK_AVOIDANCE
@@ -10007,7 +10700,7 @@ os_take_over_all_unknown_threads(dcontext_t *dcontext)
     uint i;
     uint num_threads;
     thread_id_t *tids;
-    uint threads_to_signal = 0;
+    uint threads_to_signal = 0, threads_timed_out = 0;
 
     /* We do not want to re-takeover a thread that's in between notifying us on
      * the last call to this routine and getting onto the all_threads list as
@@ -10038,7 +10731,7 @@ os_take_over_all_unknown_threads(dcontext_t *dcontext)
 #ifdef LINUX
     /* Check this thread for rseq in between setup and start. */
     if (rseq_is_registered_for_current_thread())
-        rseq_locate_rseq_regions();
+        rseq_locate_rseq_regions(false);
 #endif
 
     /* Find tids for which we have no thread record, meaning they are not under
@@ -10058,8 +10751,7 @@ os_take_over_all_unknown_threads(dcontext_t *dcontext)
              * Update: we now remove the hook for start/stop: but native_exec
              * or other individual threads going native could still hit this.
              */
-            (is_thread_currently_native(tr)
-                 IF_CLIENT_INTERFACE(&&!IS_CLIENT_THREAD(tr->dcontext))))
+            (is_thread_currently_native(tr) && !IS_CLIENT_THREAD(tr->dcontext)))
             tids[threads_to_signal++] = tids[i];
     }
 
@@ -10088,7 +10780,7 @@ os_take_over_all_unknown_threads(dcontext_t *dcontext)
 
         /* Signal the other threads. */
         for (i = 0; i < threads_to_signal; i++) {
-            thread_signal(get_process_id(), records[i].tid, SUSPEND_SIGNAL);
+            send_suspend_signal(NULL, get_process_id(), records[i].tid);
         }
         d_r_mutex_unlock(&thread_initexit_lock);
 
@@ -10105,7 +10797,12 @@ os_take_over_all_unknown_threads(dcontext_t *dcontext)
                 SYSLOG(SYSLOG_VERBOSE, INFO_ATTACHED, 3, buf, get_application_name(),
                        get_application_pid());
             }
+            /* We split the wait up so that we'll break early on an exited thread. */
             static const int wait_ms = 25;
+            int max_attempts =
+                /* Integer division rounding down is fine since we always wait 25ms. */
+                DYNAMO_OPTION(takeover_timeout_ms) / wait_ms;
+            int attempts = 0;
             while (!wait_for_event(records[i].event, wait_ms)) {
                 /* The thread may have exited (i#2601).  We assume no tid re-use. */
                 char task[64];
@@ -10113,6 +10810,24 @@ os_take_over_all_unknown_threads(dcontext_t *dcontext)
                 NULL_TERMINATE_BUFFER(task);
                 if (!os_file_exists(task, false /*!is dir*/)) {
                     SYSLOG_INTERNAL_WARNING_ONCE("thread exited while attaching");
+                    break;
+                }
+                if (++attempts > max_attempts) {
+                    if (DYNAMO_OPTION(unsafe_ignore_takeover_timeout)) {
+                        SYSLOG(
+                            SYSLOG_VERBOSE, THREAD_TAKEOVER_TIMED_OUT, 3,
+                            get_application_name(), get_application_pid(),
+                            "Continuing since -unsafe_ignore_takeover_timeout is set.");
+                        ++threads_timed_out;
+                    } else {
+                        SYSLOG(
+                            SYSLOG_VERBOSE, THREAD_TAKEOVER_TIMED_OUT, 3,
+                            get_application_name(), get_application_pid(),
+                            "Aborting. Use -unsafe_ignore_takeover_timeout to ignore.");
+                        REPORT_FATAL_ERROR_AND_EXIT(FAILED_TO_TAKE_OVER_THREADS, 2,
+                                                    get_application_name(),
+                                                    get_application_pid());
+                    }
                     break;
                 }
                 /* Else try again. */
@@ -10138,7 +10853,8 @@ os_take_over_all_unknown_threads(dcontext_t *dcontext)
     d_r_mutex_unlock(&thread_initexit_lock);
     HEAP_ARRAY_FREE(dcontext, tids, thread_id_t, num_threads, ACCT_THREAD_MGT, PROTECTED);
 
-    return threads_to_signal > 0;
+    ASSERT(threads_to_signal >= threads_timed_out);
+    return (threads_to_signal - threads_timed_out) > 0;
 }
 
 bool
@@ -10243,7 +10959,7 @@ os_thread_take_over(priv_mcontext_t *mc, kernel_sigset_t *sigset)
      * regions as rseq when the rseq syscall is never set up.
      */
     if (rseq_is_registered_for_current_thread()) {
-        rseq_locate_rseq_regions();
+        rseq_locate_rseq_regions(false);
         rseq_thread_attach(dcontext);
     }
 #endif

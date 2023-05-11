@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2016 ARM Limited. All rights reserved.
+ * Copyright (c) 2016-2021 ARM Limited. All rights reserved.
  * **********************************************************/
 
 /*
@@ -35,11 +35,54 @@
 
 #include "decode_private.h"
 
-#define ENCFAIL (uint)0 /* a value that is not a valid instruction */
+#define ENCFAIL (uint)0xFFFFFFFF /* a value that is not a valid instruction */
+
+typedef enum {
+    BYTE_REG = 0,
+    HALF_REG = 1,
+    SINGLE_REG = 2,
+    DOUBLE_REG = 3,
+    QUAD_REG = 4,
+    Z_REG = 5,
+    NOT_A_REG = 255
+} aarch64_reg_offset;
 
 byte *
 decode_common(dcontext_t *dcontext, byte *pc, byte *orig_pc, instr_t *instr);
 uint
 encode_common(byte *pc, instr_t *i, decode_info_t *di);
+
+#define MASK(size) ((1ULL << (size)) - 1ULL)
+
+#define BITS(_enc, bitmax, bitmin) \
+    ((((uint32)(_enc)) >> (bitmin)) & (uint32)MASK((bitmax) - (bitmin) + 1))
+
+#if !defined(DR_HOST_NOT_TARGET) && !defined(STANDALONE_DECODER)
+/* TODO i#3044: Vector length will be read from cpuinfo, e.g.
+ * opnd_size_from_bytes(proc_get_vector_length()));
+ * Setting to fixed size for now in order to pass unit tests.
+ */
+#    define OPSZ_SVE_VL opnd_size_from_bytes(dr_get_sve_vl() / 8)
+#else
+/* SVE vector length for off-line decoder set using -vl option with drdisas,
+ * e.g.
+ * $ drdisas -vl 256 e58057a1 85865e6b
+ *  e58057a1   str    %z1 -> +0x05(%x29)[32byte]
+ *  85865e6b   ldr    +0x37(%x19)[32byte] -> %z11
+ * $
+ */
+#    define OPSZ_SVE_VL opnd_size_from_bytes(dr_get_sve_vl() / 8)
+#endif
+
+#define RETURN_FALSE                                           \
+    CLIENT_ASSERT(false, "Unexpected state in AArch64 codec"); \
+    return false;
+
+// Frustratingly vera++ fails if RETURN_FALSE is referenced inside this macro
+#define IF_RETURN_FALSE(condition)                                 \
+    if (condition) {                                               \
+        CLIENT_ASSERT(false, "Unexpected state in AArch64 codec"); \
+        return false;                                              \
+    }
 
 #endif /* CODEC_H */

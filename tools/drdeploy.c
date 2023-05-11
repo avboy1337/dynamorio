@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2011-2020 Google, Inc.  All rights reserved.
+ * Copyright (c) 2011-2022 Google, Inc.  All rights reserved.
  * Copyright (c) 2008-2010 VMware, Inc.  All rights reserved.
  * **********************************************************/
 
@@ -30,8 +30,6 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH
  * DAMAGE.
  */
-
-/* compile with make VMAP=1 for a vmap version (makefile defaults to VMSAFE version) */
 
 #include "configure.h"
 
@@ -184,7 +182,7 @@ const char *options_list_str =
     "                          If a local file already exists it will take precedence.\n"
     "       -norun             Create a configuration that excludes the application\n"
     "                          from running under DR control.  Useful for following\n"
-    "                          all child processes except a handful (blacklist).\n"
+    "                          all child processes except a handful (blocklist).\n"
 #endif
     "       -debug             Use the DR debug library\n"
     "       -32                Target 32-bit or WOW64 applications\n"
@@ -267,8 +265,8 @@ const char *options_list_str =
     "                          wait.  A value of 0 means don't wait for nudges to\n"
     "                          complete."
 #    else  /* WINDOWS */
-    /* FIXME i#840: integrate nudgeunix into drconfig on Unix */
-    "Note: please use the nudgeunix tool to nudge processes on Unix.\n";
+    /* FIXME i#840: integrate drnudgeunix into drconfig on Unix */
+    "Note: please use the drnudgeunix tool to nudge processes on Unix.\n";
 #    endif /* !WINDOWS */
 #else      /* DRCONFIG */
     "       -no_wait           Return immediately: do not wait for application exit.\n"
@@ -291,16 +289,36 @@ const char *options_list_str =
     "       -static            Do not inject under the assumption that the application\n"
     "                          is statically linked with DynamoRIO.  Instead, trigger\n"
     "                          automated takeover.\n"
+#    ifndef MACOS /* XXX i#1285: private loader NYI on MacOS */
+    "       -late              Requests late injection.\n"
+#    endif
 #    ifdef UNIX       /* FIXME i#725: Windows attach NYI */
 #        ifndef MACOS /* XXX i#1285: private loader NYI on MacOS */
     "       -early             Requests early injection (the default).\n"
-    "       -late              Requests late injection.\n"
 #        endif
-    "       -attach <pid>      Attach to the process with the given pid.  Pass 0\n"
-    "                          for pid to launch and inject into a new process.\n"
     "       -logdir <dir>      Logfiles will be stored in this directory.\n"
 #    endif
+#    ifdef UNIX
+    "       -attach <pid>      Attach to the process with the given pid.\n"
+    "                          Attaching is an experimental feature and is not yet\n"
+    "                          as well-supported as launching a new process.\n"
+#    endif
+#    ifdef WINDOWS
+    "       -attach <pid>      Attach to the process with the given pid.\n"
+    "                          Attaching is an experimental feature and is not yet\n"
+    "                          as well-supported as launching a new process.\n"
+    "                          Attaching to a process in the middle of a blocking\n"
+    "                          system call could fail.\n"
+    "                          Try takeover_sleep and larger takeovers to increase\n"
+    "                          the chances of success:\n"
+    "       -takeover_sleep    Sleep 1 millisecond between takeover attempts.\n"
+    "       -takeovers <num>   Number of takeover attempts. Defaults to 8.\n"
+    "                          The larger, the more likely attach will succeed,\n"
+    "                          however, the attach process will take longer.\n"
+#    endif
     "       -use_dll <dll>     Inject given dll instead of configured DR dll.\n"
+    "       -use_alt_dll <dll> Use the given dll as the alternate-bitwidth DR dll.\n"
+    "       -tool_dir <dir>    Directory containing tool configuration files.\n"
     "       -force             Inject regardless of configuration.\n"
     "       -exit0             Return a 0 exit code instead of the app's exit code.\n"
     "\n"
@@ -384,17 +402,20 @@ print_tool_list(FILE *stream)
  * install time.  Thus we only expect to have it for a package build.
  */
 static void
-read_tool_list(const char *dr_root, dr_platform_t dr_platform)
+read_tool_list(const char *dr_toolconfig_dir, dr_platform_t dr_platform)
 {
     FILE *f;
     char list_file[MAXIMUM_PATH];
     size_t sofar = 0;
     const char *arch = IF_X64_ELSE("64", "32");
+    /* clear global tool list on re-read */
+    tool_list[0] = '\0';
+
     if (dr_platform == DR_PLATFORM_32BIT)
         arch = "32";
     else if (dr_platform == DR_PLATFORM_64BIT)
         arch = "64";
-    _snprintf(list_file, BUFFER_SIZE_ELEMENTS(list_file), "%s/tools/list%s", dr_root,
+    _snprintf(list_file, BUFFER_SIZE_ELEMENTS(list_file), "%s/list%s", dr_toolconfig_dir,
               arch);
     NULL_TERMINATE_BUFFER(list_file);
     f = fopen_utf8(list_file, "r");
@@ -450,11 +471,13 @@ unregister_proc(const char *process, process_id_t pid, bool global,
 }
 
 /* Check if the provided root directory actually has the files we
- * expect.  Returns whether a fatal problem.
+ * expect.  Returns whether a fatal problem.  On success,
+ * fills in dr_lib_path and dr_alt_lib_path if they are non-NULL.
  */
 static bool
-check_dr_root(const char *dr_root, bool debug, dr_platform_t dr_platform, bool preinject,
-              bool report)
+expand_dr_root(const char *dr_root, bool debug, dr_platform_t dr_platform, bool preinject,
+               bool report, OUT char *dr_lib_path, size_t dr_lib_path_sz,
+               OUT char *dr_alt_lib_path, size_t dr_alt_lib_path_sz)
 {
     int i;
     char buf[MAXIMUM_PATH];
@@ -462,34 +485,46 @@ check_dr_root(const char *dr_root, bool debug, dr_platform_t dr_platform, bool p
     /* FIXME i#1569: port DynamoRIO to AArch64 so we can enable the check warning */
     bool nowarn = IF_X86_ELSE(false, true);
 
-    const char *checked_files[] = {
+    typedef struct _file_entry_t {
+        const char *suffix;
+        bool is_core;
+        bool is_debug;
+        bool is_preinject;
+        dr_platform_t platform;
+    } file_entry_t;
+    const file_entry_t checked_files[] = {
 #ifdef WINDOWS
-        "lib32\\drpreinject.dll",        "lib32\\release\\dynamorio.dll",
-        "lib32\\debug\\dynamorio.dll",   "lib64\\drpreinject.dll",
-        "lib64\\release\\dynamorio.dll", "lib64\\debug\\dynamorio.dll"
+        { "lib32\\drpreinject.dll", false, false, true, DR_PLATFORM_32BIT },
+        { "lib32\\release\\dynamorio.dll", true, false, false, DR_PLATFORM_32BIT },
+        { "lib32\\debug\\dynamorio.dll", true, true, false, DR_PLATFORM_32BIT },
+        { "lib64\\drpreinject.dll", false, false, true, DR_PLATFORM_64BIT },
+        { "lib64\\release\\dynamorio.dll", true, false, false, DR_PLATFORM_64BIT },
+        { "lib64\\debug\\dynamorio.dll", true, true, false, DR_PLATFORM_64BIT },
 #elif defined(MACOS)
-        "lib32/debug/libdrpreload.dylib",   "lib32/debug/libdynamorio.dylib",
-        "lib32/release/libdrpreload.dylib", "lib32/release/libdynamorio.dylib",
-        "lib64/debug/libdrpreload.dylib",   "lib64/debug/libdynamorio.dylib",
-        "lib64/release/libdrpreload.dylib", "lib64/release/libdynamorio.dylib"
+        { "lib32/debug/libdrpreload.dylib", false, true, true, DR_PLATFORM_32BIT },
+        { "lib32/debug/libdynamorio.dylib", true, true, false, DR_PLATFORM_32BIT },
+        { "lib32/release/libdrpreload.dylib", false, false, true, DR_PLATFORM_32BIT },
+        { "lib32/release/libdynamorio.dylib", true, false, false, DR_PLATFORM_32BIT },
+        { "lib64/debug/libdrpreload.dylib", true, false, true, DR_PLATFORM_64BIT },
+        { "lib64/debug/libdynamorio.dylib", true, true, false, DR_PLATFORM_64BIT },
+        { "lib64/release/libdrpreload.dylib", false, false, true, DR_PLATFORM_64BIT },
+        { "lib64/release/libdynamorio.dylib", true, false, false, DR_PLATFORM_64BIT },
 #else /* LINUX */
         /* With early injection the default, we don't require preload to exist. */
-        "lib32/debug/libdynamorio.so", "lib32/release/libdynamorio.so",
-        "lib64/debug/libdynamorio.so", "lib64/release/libdynamorio.so"
+        { "lib32/debug/libdynamorio.so", true, true, false, DR_PLATFORM_32BIT },
+        { "lib32/release/libdynamorio.so", true, false, false, DR_PLATFORM_32BIT },
+        { "lib64/debug/libdynamorio.so", true, true, false, DR_PLATFORM_64BIT },
+        { "lib64/release/libdynamorio.so", true, false, false, DR_PLATFORM_64BIT },
 #endif
     };
 
-    const char *arch = IF_X64_ELSE("lib64", "lib32");
-    if (dr_platform == DR_PLATFORM_32BIT)
-        arch = "lib32";
-    else if (dr_platform == DR_PLATFORM_64BIT)
-        arch = "lib64";
+    if (dr_platform == DR_PLATFORM_DEFAULT)
+        dr_platform = IF_X64_ELSE(DR_PLATFORM_64BIT, DR_PLATFORM_32BIT);
 
     if (DR_dll_not_needed) {
-        /* assume user knows what he's doing */
-        return true;
+        /* An explicit path was passed so don't require a regular installation. */
+        nowarn = true;
     }
-
     /* don't warn if running from a build dir (i#458) which we attempt to detect
      * by looking for CMakeCache.txt in the root dir
      * (warnings can also be suppressed via -quiet)
@@ -498,15 +533,36 @@ check_dr_root(const char *dr_root, bool debug, dr_platform_t dr_platform, bool p
     if (does_file_exist(buf))
         nowarn = true;
 
+    bool found_lib = false;
+    if (dr_alt_lib_path != NULL)
+        dr_alt_lib_path[0] = '\0';
     for (i = 0; i < BUFFER_SIZE_ELEMENTS(checked_files); i++) {
-        _snprintf(buf, BUFFER_SIZE_ELEMENTS(buf), "%s/%s", dr_root, checked_files[i]);
-        if (!does_file_exist(buf)) {
+        _snprintf(buf, BUFFER_SIZE_ELEMENTS(buf), "%s/%s", dr_root,
+                  checked_files[i].suffix);
+        if (does_file_exist(buf)) {
+            if (checked_files[i].is_core &&
+                ((debug && checked_files[i].is_debug) ||
+                 (!debug && !checked_files[i].is_debug))) {
+                if (checked_files[i].platform == dr_platform) {
+                    found_lib = true;
+                    if (dr_lib_path != NULL) {
+                        _snprintf(dr_lib_path, dr_lib_path_sz, "%s", buf);
+                        dr_lib_path[dr_lib_path_sz - 1] = '\0';
+                    }
+                } else {
+                    if (dr_alt_lib_path != NULL) {
+                        _snprintf(dr_alt_lib_path, dr_alt_lib_path_sz, "%s", buf);
+                        dr_alt_lib_path[dr_alt_lib_path_sz - 1] = '\0';
+                    }
+                }
+            }
+        } else {
             ok = false;
             if (!nocheck &&
-                ((preinject && strstr(checked_files[i], "drpreinject")) ||
-                 (!preinject && debug && strstr(checked_files[i], "debug") != NULL) ||
-                 (!preinject && !debug && strstr(checked_files[i], "release") != NULL)) &&
-                strstr(checked_files[i], arch) != NULL) {
+                ((preinject && checked_files[i].is_preinject) ||
+                 (!preinject && debug && checked_files[i].is_debug) ||
+                 (!preinject && !debug && !checked_files[i].is_debug)) &&
+                checked_files[i].platform == dr_platform) {
                 /* We don't want to create a .1config file that won't be freed
                  * b/c the core is never injected
                  */
@@ -517,7 +573,7 @@ check_dr_root(const char *dr_root, bool debug, dr_platform_t dr_platform, bool p
                 }
                 return false;
             } else {
-                if (strstr(checked_files[i], arch) == NULL) {
+                if (checked_files[i].platform == DR_PLATFORM_DEFAULT) {
                     /* Support a single-bitwidth package. */
                     ok = true;
                 } else if (!nowarn)
@@ -525,16 +581,28 @@ check_dr_root(const char *dr_root, bool debug, dr_platform_t dr_platform, bool p
             }
         }
     }
+    assert(found_lib);
     if (!ok && !nowarn)
         warn("%s does not appear to be a valid DynamoRIO root", dr_root);
     return true;
+}
+
+/* Check if the provided root directory actually has the files we
+ * expect.  Returns whether a fatal problem.
+ */
+static bool
+check_dr_root(const char *dr_root, bool debug, dr_platform_t dr_platform, bool preinject,
+              bool report)
+{
+    return expand_dr_root(dr_root, debug, dr_platform, preinject, report, NULL, 0, NULL,
+                          0);
 }
 
 /* Register a process to run under DR */
 bool
 register_proc(const char *process, process_id_t pid, bool global, const char *dr_root,
               const dr_operation_mode_t dr_mode, bool debug, dr_platform_t dr_platform,
-              const char *extra_ops)
+              const char *extra_ops, const char *custom_dll, const char *custom_alt_dll)
 {
     dr_config_status_t status;
 
@@ -543,19 +611,33 @@ register_proc(const char *process, process_id_t pid, bool global, const char *dr
         error("cannot access DynamoRIO root directory %s", dr_root);
         return false;
     }
-#ifdef CLIENT_INTERFACE
     if (dr_mode == DR_MODE_NONE) {
         error("you must provide a DynamoRIO mode");
         return false;
     }
-#endif
 
-    /* warn if the DR root directory doesn't look right, unless -norun,
-     * in which case don't bother
-     */
-    if (dr_mode != DR_MODE_DO_NOT_RUN &&
-        !check_dr_root(dr_root, debug, dr_platform, false /*!pre*/, true /*report*/))
-        return false;
+    char dr_lib_path[MAXIMUM_PATH];
+    char dr_alt_lib_path[MAXIMUM_PATH];
+    if (custom_dll != NULL) {
+        strncpy(dr_lib_path, custom_dll, BUFFER_SIZE_ELEMENTS(dr_lib_path));
+        NULL_TERMINATE_BUFFER(dr_lib_path);
+    } else {
+        bool check_ok =
+            expand_dr_root(dr_root, debug, dr_platform, false /*!pre*/,
+                           dr_mode != DR_MODE_DO_NOT_RUN /*report*/, dr_lib_path,
+                           BUFFER_SIZE_ELEMENTS(dr_lib_path), dr_alt_lib_path,
+                           BUFFER_SIZE_ELEMENTS(dr_alt_lib_path));
+        /* Warn if the DR root directory doesn't look right, unless -norun,
+         * in which case don't bother.
+         */
+        if (dr_mode != DR_MODE_DO_NOT_RUN && !check_ok)
+            return false;
+    }
+    if (custom_alt_dll != NULL) {
+        /* Overwrite what expand_dr_root found if an alt is specified. */
+        strncpy(dr_alt_lib_path, custom_alt_dll, BUFFER_SIZE_ELEMENTS(dr_alt_lib_path));
+        NULL_TERMINATE_BUFFER(dr_alt_lib_path);
+    }
 
     if (dr_process_is_registered(process, pid, global, dr_platform, NULL, NULL, NULL,
                                  NULL)) {
@@ -596,6 +678,12 @@ register_proc(const char *process, process_id_t pid, bool global, const char *dr
 #endif
         return false;
     }
+    status = dr_register_inject_paths(
+        process, pid, global, dr_platform, dr_lib_path[0] == '\0' ? NULL : dr_lib_path,
+        dr_alt_lib_path[0] == '\0' ? NULL : dr_alt_lib_path);
+    if (status != DR_SUCCESS)
+        warn("failed to specify DynamoRIO library paths: falling back to defaults");
+
     return true;
 }
 
@@ -830,11 +918,11 @@ add_extra_option(char *buf, size_t bufsz, size_t *sofar, const char *fmt, ...)
  *   USER_NOTICE=This tool is currently experimental.  Please report issues to <url>.
  */
 static bool
-read_tool_file(const char *toolname, const char *dr_root, dr_platform_t dr_platform,
-               char *client, size_t client_size, char *alt_client, size_t alt_size,
-               char *ops, size_t ops_size, size_t *ops_sofar, char *tool_ops,
-               size_t tool_ops_size, size_t *tool_ops_sofar, char *native_path OUT,
-               size_t native_path_size)
+read_tool_file(const char *toolname, const char *dr_root, const char *dr_toolconfig_dir,
+               dr_platform_t dr_platform, char *client, size_t client_size,
+               char *alt_client, size_t alt_size, char *ops, size_t ops_size,
+               size_t *ops_sofar, char *tool_ops, size_t tool_ops_size,
+               size_t *tool_ops_sofar, char *native_path OUT, size_t native_path_size)
 {
     FILE *f;
     char config_file[MAXIMUM_PATH];
@@ -845,8 +933,8 @@ read_tool_file(const char *toolname, const char *dr_root, dr_platform_t dr_platf
         arch = "32";
     else if (dr_platform == DR_PLATFORM_64BIT)
         arch = "64";
-    _snprintf(config_file, BUFFER_SIZE_ELEMENTS(config_file), "%s/tools/%s.drrun%s",
-              dr_root, toolname, arch);
+    _snprintf(config_file, BUFFER_SIZE_ELEMENTS(config_file), "%s/%s.drrun%s",
+              dr_toolconfig_dir, toolname, arch);
     NULL_TERMINATE_BUFFER(config_file);
     info("reading tool config file %s", config_file);
     f = fopen_utf8(config_file, "r");
@@ -886,6 +974,9 @@ read_tool_file(const char *toolname, const char *dr_root, dr_platform_t dr_platf
             _snprintf(alt_client, alt_size, "%s/%s", dr_root,
                       line + strlen(IF_X64_ELSE("CLIENT32_REL=", "CLIENT64_REL=")));
             alt_client[alt_size - 1] = '\0';
+            if (!does_file_exist(alt_client)) {
+                alt_client[0] = '\0';
+            }
             if (native_path[0] != '\0') {
                 add_extra_option(tool_ops, tool_ops_size, tool_ops_sofar, "\"%s\"",
                                  alt_client);
@@ -909,6 +1000,9 @@ read_tool_file(const char *toolname, const char *dr_root, dr_platform_t dr_platf
             strncpy(alt_client,
                     line + strlen(IF_X64_ELSE("CLIENT32_ABS=", "CLIENT64_ABS=")),
                     alt_size);
+            if (!does_file_exist(alt_client)) {
+                alt_client[0] = '\0';
+            }
             if (native_path[0] != '\0') {
                 add_extra_option(tool_ops, tool_ops_size, tool_ops_sofar, "\"%s\"",
                                  alt_client);
@@ -1066,11 +1160,7 @@ _tmain(int argc, TCHAR *targv[])
     dr_operation_mode_t dr_mode = DR_MODE_NONE;
 #    else
     /* only one choice so no -mode */
-#        ifdef CLIENT_INTERFACE
     dr_operation_mode_t dr_mode = DR_MODE_CODE_MANIPULATION;
-#        else
-    dr_operation_mode_t dr_mode = DR_MODE_NONE;
-#        endif
 #    endif
 #endif /* !DRINJECT */
     char extra_ops[MAX_OPTIONS_STRING];
@@ -1083,6 +1173,7 @@ _tmain(int argc, TCHAR *targv[])
 #ifdef WINDOWS
     /* FIXME i#840: Implement nudges on Linux. */
     bool nudge_all = false;
+    bool use_late_injection = false;
     process_id_t nudge_pid = 0;
     client_id_t nudge_id = 0;
     uint64 nudge_arg = 0;
@@ -1095,38 +1186,47 @@ _tmain(int argc, TCHAR *targv[])
     int exitcode;
 #if defined(DRRUN) || defined(DRINJECT)
     char *pidfile = NULL;
-    bool showstats = false;
-    bool showmem = false;
     bool force_injection = false;
     bool inject = true;
     int limit = 0; /* in seconds */
-    char *drlib_path = NULL;
 #    ifdef WINDOWS
+    bool showstats = false;
+    bool showmem = false;
     time_t start_time, end_time;
 #    else
     bool use_ptrace = false;
     bool kill_group = false;
 #    endif
+    process_id_t attach_pid = 0;
     char *app_name = NULL;
     char full_app_name[MAXIMUM_PATH];
     const char **app_argv;
-    char custom_dll[MAXIMUM_PATH];
     int errcode;
     void *inject_data;
     bool success;
     bool exit0 = false;
 #endif
+    char *drlib_path = NULL;
+#if defined(DRCONFIG) || defined(DRRUN)
+    char *drlib_alt_path = NULL;
+    char custom_alt_dll[MAXIMUM_PATH];
+#endif
+    char custom_dll[MAXIMUM_PATH];
+    char *dr_toolconfig_dir = NULL;
+    char custom_toolconfig_dir[MAXIMUM_PATH];
     int i;
 #ifndef DRINJECT
     size_t j;
 #endif
     char buf[MAXIMUM_PATH];
     char default_root[MAXIMUM_PATH];
+    char default_toolconfig_dir[MAXIMUM_PATH];
     char *c;
 #if defined(DRCONFIG) || defined(DRRUN)
     char native_tool[MAXIMUM_PATH];
 #endif
 #ifdef DRRUN
+    char exe[MAXIMUM_PATH];
     void *tofree = NULL;
     bool configure = true;
 #endif
@@ -1148,6 +1248,18 @@ _tmain(int argc, TCHAR *targv[])
     native_tool[0] = '\0';
 #endif
 
+    /* Quick pass to set verbose for info() logs before main parsing. */
+    for (i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-verbose") == 0 || strcmp(argv[i], "-v") == 0) {
+            verbose = true;
+            break;
+        }
+        if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "-t") == 0 ||
+            strcmp(argv[i], "-c32") == 0 || strcmp(argv[i], "-c64") == 0 ||
+            strcmp(argv[i], "--") == 0)
+            break;
+    }
+
     /* default root: we assume this tool is in <root>/bin{32,64}/dr*.exe */
     get_absolute_path(argv[0], buf, BUFFER_SIZE_ELEMENTS(buf));
     NULL_TERMINATE_BUFFER(buf);
@@ -1161,8 +1273,14 @@ _tmain(int argc, TCHAR *targv[])
     dr_root = default_root;
     info("default root: %s", default_root);
 
-    /* we re-read the tool list if the root or platform change */
-    read_tool_list(dr_root, dr_platform);
+    _snprintf(default_toolconfig_dir, BUFFER_SIZE_ELEMENTS(default_toolconfig_dir),
+              "%s/%s", dr_root, "tools");
+    NULL_TERMINATE_BUFFER(default_toolconfig_dir);
+    dr_toolconfig_dir = default_toolconfig_dir;
+    info("default toolconfig dir: %s", default_toolconfig_dir);
+
+    /* we re-read the tool list if the root, platform or toolconfig dir change */
+    read_tool_list(dr_toolconfig_dir, dr_platform);
 
     /* parse command line */
     for (i = 1; i < argc; i++) {
@@ -1216,23 +1334,26 @@ _tmain(int argc, TCHAR *targv[])
 #endif
         else if (strcmp(argv[i], "-32") == 0) {
             dr_platform = DR_PLATFORM_32BIT;
-            read_tool_list(dr_root, dr_platform);
+            read_tool_list(dr_toolconfig_dir, dr_platform);
             continue;
         } else if (strcmp(argv[i], "-64") == 0) {
             dr_platform = DR_PLATFORM_64BIT;
-            read_tool_list(dr_root, dr_platform);
+            read_tool_list(dr_toolconfig_dir, dr_platform);
             continue;
         }
 #if defined(DRRUN) || defined(DRINJECT)
+#    ifdef WINDOWS
         else if (strcmp(argv[i], "-stats") == 0) {
             showstats = true;
             continue;
         } else if (strcmp(argv[i], "-mem") == 0) {
             showmem = true;
             continue;
-        } else if (strcmp(argv[i], "-no_inject") == 0 ||
-                   /* support old drinjectx param name */
-                   strcmp(argv[i], "-noinject") == 0 || strcmp(argv[i], "-static") == 0) {
+        }
+#    endif
+        else if (strcmp(argv[i], "-no_inject") == 0 ||
+                 /* support old drinjectx param name */
+                 strcmp(argv[i], "-noinject") == 0 || strcmp(argv[i], "-static") == 0) {
             DR_dll_not_needed = true;
             inject = false;
             continue;
@@ -1243,32 +1364,58 @@ _tmain(int argc, TCHAR *targv[])
             limit = -1;
             continue;
         }
+#    ifndef MACOS /* XXX i#1285: private loader NYI on MacOS */
+        else if (strcmp(argv[i], "-late") == 0) {
+            /* Appending -no_early_inject to extra_ops communicates our intentions
+             * to drinjectlib on UNIX, as well as the core for all platforms.
+             */
+            add_extra_option(extra_ops, BUFFER_SIZE_ELEMENTS(extra_ops), &extra_ops_sofar,
+                             "-no_early_inject");
+#        ifdef WINDOWS
+            use_late_injection = true;
+#        endif
+            continue;
+        }
+#    endif
+        else if (strcmp(argv[i], "-attach") == 0) {
+            if (i + 1 >= argc)
+                usage(false, "attach requires a process id");
+            const char *pid_str = argv[++i];
+            process_id_t pid = strtoul(pid_str, NULL, 10);
+            if (pid == ULONG_MAX)
+                usage(false, "attach expects an integer pid: '%s'", pid_str);
+            if (pid == 0) {
+                usage(false, "attach passed an invalid pid: '%s'", pid_str);
+            }
+            attach_pid = pid;
+#    ifdef UNIX
+            use_ptrace = true;
+#    endif
+#    ifdef WINDOWS
+            use_late_injection = true;
+            add_extra_option(extra_ops, BUFFER_SIZE_ELEMENTS(extra_ops), &extra_ops_sofar,
+                             "-skip_terminating_threads");
+#    endif
+            continue;
+        } else if (strcmp(argv[i], "-takeovers") == 0) {
+            const char *num_attemps = argv[++i];
+            add_extra_option(extra_ops, BUFFER_SIZE_ELEMENTS(extra_ops), &extra_ops_sofar,
+                             "-takeover_attempts %s", num_attemps);
+            continue;
+        } else if (strcmp(argv[i], "-takeover_sleep") == 0) {
+            add_extra_option(extra_ops, BUFFER_SIZE_ELEMENTS(extra_ops), &extra_ops_sofar,
+                             "-sleep_between_takeovers");
+            continue;
+        }
 #    ifdef UNIX
         else if (strcmp(argv[i], "-use_ptrace") == 0) {
             /* Undocumented option for using ptrace on a fresh process. */
             use_ptrace = true;
             continue;
-        } else if (strcmp(argv[i], "-attach") == 0) {
-            const char *pid_str = argv[++i];
-            process_id_t pid = strtoul(pid_str, NULL, 10);
-            if (pid == ULONG_MAX)
-                usage(false, "-attach expects an integer pid");
-            if (pid != 0)
-                usage(false, "attaching to running processes is not yet implemented");
-            use_ptrace = true;
-            /* FIXME: use pid below to attach. */
-            continue;
         }
 #        ifndef MACOS /* XXX i#1285: private loader NYI on MacOS */
         else if (strcmp(argv[i], "-early") == 0) {
             /* Now the default: left here just for back-compat */
-            continue;
-        } else if (strcmp(argv[i], "-late") == 0) {
-            /* Appending -no_early_inject to extra_ops communicates our intentions
-             * to drinjectlib.
-             */
-            add_extra_option(extra_ops, BUFFER_SIZE_ELEMENTS(extra_ops), &extra_ops_sofar,
-                             "-no_early_inject");
             continue;
         }
 #        endif
@@ -1293,7 +1440,15 @@ _tmain(int argc, TCHAR *targv[])
             /* support -dr_home alias used by script */
             strcmp(argv[i], "-dr_home") == 0) {
             dr_root = argv[++i];
-            read_tool_list(dr_root, dr_platform);
+            /* Modify the default toolconfig dir only.
+             * If toolconfig dir is specified explicitly, dr_toolconfig_dir points
+             * to other buffer, hence is not affected by overwriting the default.
+             */
+            _snprintf(default_toolconfig_dir,
+                      BUFFER_SIZE_ELEMENTS(default_toolconfig_dir), "%s/%s", dr_root,
+                      "tools");
+            NULL_TERMINATE_BUFFER(default_toolconfig_dir);
+            read_tool_list(dr_toolconfig_dir, dr_platform);
         } else if (strcmp(argv[i], "-logdir") == 0) {
             /* Accept this for compatibility with the old drrun shell script. */
             const char *dir = argv[++i];
@@ -1396,15 +1551,31 @@ _tmain(int argc, TCHAR *targv[])
                              "%s", argv[++i]);
         }
 #endif
-#if defined(DRRUN) || defined(DRINJECT)
-        else if (strcmp(argv[i], "-pidfile") == 0) {
-            pidfile = argv[++i];
-        } else if (strcmp(argv[i], "-use_dll") == 0) {
+        else if (strcmp(argv[i], "-use_dll") == 0) {
             DR_dll_not_needed = true;
             /* Support relative path: very useful! */
             get_absolute_path(argv[++i], custom_dll, BUFFER_SIZE_ELEMENTS(custom_dll));
             NULL_TERMINATE_BUFFER(custom_dll);
             drlib_path = custom_dll;
+        }
+#if defined(DRCONFIG) || defined(DRRUN)
+        else if (strcmp(argv[i], "-use_alt_dll") == 0) {
+            get_absolute_path(argv[++i], custom_alt_dll,
+                              BUFFER_SIZE_ELEMENTS(custom_alt_dll));
+            NULL_TERMINATE_BUFFER(custom_alt_dll);
+            drlib_alt_path = custom_alt_dll;
+        }
+#endif
+        else if (strcmp(argv[i], "-tool_dir") == 0) {
+            get_absolute_path(argv[++i], custom_toolconfig_dir,
+                              BUFFER_SIZE_ELEMENTS(custom_toolconfig_dir));
+            NULL_TERMINATE_BUFFER(custom_toolconfig_dir);
+            dr_toolconfig_dir = custom_toolconfig_dir;
+            read_tool_list(dr_toolconfig_dir, dr_platform);
+        }
+#if defined(DRRUN) || defined(DRINJECT)
+        else if (strcmp(argv[i], "-pidfile") == 0) {
+            pidfile = argv[++i];
         } else if (strcmp(argv[i], "-s") == 0) {
             limit = atoi(argv[++i]);
             if (limit <= 0)
@@ -1468,9 +1639,9 @@ _tmain(int argc, TCHAR *targv[])
                      * cannot be overridden by DR options passed here.
                      * The user must use -c or -client to do that.
                      */
-                    if (!read_tool_file(client, dr_root, dr_platform, client_buf,
-                                        BUFFER_SIZE_ELEMENTS(client_buf), alt_buf,
-                                        BUFFER_SIZE_ELEMENTS(alt_buf), extra_ops,
+                    if (!read_tool_file(client, dr_root, dr_toolconfig_dir, dr_platform,
+                                        client_buf, BUFFER_SIZE_ELEMENTS(client_buf),
+                                        alt_buf, BUFFER_SIZE_ELEMENTS(alt_buf), extra_ops,
                                         BUFFER_SIZE_ELEMENTS(extra_ops), &extra_ops_sofar,
                                         single_client_ops,
                                         BUFFER_SIZE_ELEMENTS(single_client_ops),
@@ -1530,10 +1701,28 @@ done_with_options:
 
 #if defined(DRRUN) || defined(DRINJECT)
 #    ifdef DRRUN
+    if (attach_pid != 0) {
+        ssize_t size = 0;
+#        ifdef UNIX
+        char exe_str[MAXIMUM_PATH];
+        _snprintf(exe_str, BUFFER_SIZE_ELEMENTS(exe_str), "/proc/%d/exe", attach_pid);
+        NULL_TERMINATE_BUFFER(exe_str);
+        size = readlink(exe_str, exe, BUFFER_SIZE_ELEMENTS(exe));
+        if (size > 0) {
+            if (size < BUFFER_SIZE_ELEMENTS(exe))
+                exe[size] = '\0';
+            else
+                NULL_TERMINATE_BUFFER(exe);
+        } else {
+            usage(false, "attach to invalid pid");
+        }
+#        endif /* UNIX */
+        app_name = exe;
+    }
     /* Support no app if the tool has its own frontend, under the assumption
      * it may have post-processing or other features.
      */
-    if (i < argc || native_tool[0] == '\0') {
+    if (attach_pid == 0 && (i < argc || native_tool[0] == '\0')) {
 #    endif
         if (i >= argc)
             usage(false, "%s", "no app specified");
@@ -1616,7 +1805,7 @@ done_with_options:
     }
     if (action == action_register) {
         if (!register_proc(process, 0, global, dr_root, dr_mode, use_debug, dr_platform,
-                           extra_ops))
+                           extra_ops, drlib_path, drlib_alt_path))
             die();
         for (j = 0; j < num_clients; j++) {
             if (!register_client(process, 0, global, dr_platform, client_ids[j],
@@ -1736,13 +1925,25 @@ done_with_options:
     if (limit == 0 && !use_ptrace && !kill_group) {
         info("will exec %s", app_name);
         errcode = dr_inject_prepare_to_exec(app_name, app_argv, &inject_data);
+    } else if (attach_pid != 0) {
+        /* We always try to avoid hanging on a blocked syscall. */
+        errcode = dr_inject_prepare_to_attach(attach_pid, app_name,
+                                              /*wait_syscall=*/false, &inject_data);
     } else
-#    endif /* UNIX */
+#    elif defined(WINDOWS)
+    if (attach_pid != 0) {
+        errcode = dr_inject_process_attach(attach_pid, &inject_data, &app_name);
+    } else
+#    endif /* WINDOWS */
     {
         errcode = dr_inject_process_create(app_name, app_argv, &inject_data);
         info("created child with pid " PIDFMT " for %s",
              dr_inject_get_process_id(inject_data), app_name);
     }
+#    ifdef WINDOWS
+    if (use_late_injection)
+        dr_inject_use_late_injection(inject_data);
+#    endif
 #    ifdef UNIX
     if (limit != 0 && kill_group) {
         /* Move the child to its own process group. */
@@ -1799,7 +2000,8 @@ done_with_options:
     if (configure) {
         process = dr_inject_get_image_name(inject_data);
         if (!register_proc(process, dr_inject_get_process_id(inject_data), global,
-                           dr_root, dr_mode, use_debug, dr_platform, extra_ops))
+                           dr_root, dr_mode, use_debug, dr_platform, extra_ops,
+                           drlib_path, drlib_alt_path))
             goto error;
         for (j = 0; j < num_clients; j++) {
             if (!register_client(process, dr_inject_get_process_id(inject_data), global,
@@ -1831,6 +2033,10 @@ done_with_options:
 
     if (inject && !dr_inject_process_inject(inject_data, force_injection, drlib_path)) {
 #    ifdef DRRUN
+        if (attach_pid != 0) {
+            error("unable to attach; check pid and system ptrace permissions");
+            goto error;
+        }
         error("unable to inject: exec of |%s| failed", drlib_path);
 #    else
         error("unable to inject: did you forget to run drconfig first?");
@@ -1871,7 +2077,8 @@ done_with_options:
         success = true; /* Don't kill the child if we're not waiting. */
     }
 
-    exitcode = dr_inject_process_exit(inject_data, !success /*kill process*/);
+    exitcode = dr_inject_process_exit(
+        inject_data, attach_pid != 0 ? false : !success /*kill process*/);
 
     if (limit < 0)
         exitcode = 0; /* Return success if we didn't wait. */
@@ -1884,8 +2091,10 @@ error:
     /* we created the process suspended so if we later had an error be sure
      * to kill it instead of leaving it hanging
      */
-    if (inject_data != NULL)
-        dr_inject_process_exit(inject_data, true /*kill process*/);
+    if (inject_data != NULL) {
+        dr_inject_process_exit(inject_data,
+                               attach_pid != 0 ? false : true /*kill process*/);
+    }
 #    ifdef DRRUN
     if (tofree != NULL)
         free(tofree);

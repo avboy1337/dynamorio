@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2014-2020 Google, Inc.  All rights reserved.
+ * Copyright (c) 2014-2022 Google, Inc.  All rights reserved.
  * **********************************************************/
 
 /*
@@ -35,7 +35,7 @@
 #include "decode.h"
 #include "decode_private.h"
 #include "decode_fast.h" /* ensure we export decode_next_pc, decode_sizeof */
-#include "instr_create.h"
+#include "instr_create_shared.h"
 #include "disassemble.h"
 
 /* ARM decoder.
@@ -120,7 +120,7 @@ decode_state_advance(decode_state_t *state, decode_info_t *di)
 }
 
 static bool
-decode_in_it_block(decode_state_t *state, app_pc pc)
+decode_in_it_block(decode_state_t *state, app_pc pc, decode_info_t *di)
 {
     if (state->itb_info.num_instrs != 0) {
         LOG(THREAD_GET, LOG_EMIT, 5, "in IT?: cur=%d/%d, " PFX " vs " PFX "\n",
@@ -140,9 +140,19 @@ decode_in_it_block(decode_state_t *state, app_pc pc)
         /* Handle the caller invoking decode 2x in a row on the same
          * pc on the OP_it instr or a non-final instr in the block.
          */
-        if (pc == state->pc - THUMB_SHORT_INSTR_SIZE ||
-            pc == state->pc - THUMB_LONG_INSTR_SIZE) {
-            if (state->itb_info.cur_instr == 0) {
+        if ((di->T32_16 && pc == state->pc - THUMB_SHORT_INSTR_SIZE) ||
+            (!di->T32_16 && pc == state->pc - THUMB_LONG_INSTR_SIZE)) {
+            if (state->itb_info.cur_instr == 0 ||
+                /* This is still fragile when crossing usage sequences.  The state is
+                 * left in a final-IT-member state after bb building, and
+                 * subsequently decoding the block again can result in incorrect
+                 * advance-undoing which leads to incorrect predicate application.
+                 *
+                 * Our solution here is to do a raw byte check for OP_it, which is
+                 * encoded as 0xbfXY where X is anything and Y is anything with at
+                 * least 1 bit set.
+                 */
+                (di->T32_16 && *(pc + 1) == 0xbf && ((*pc) & 0x0f) != 0)) {
                 ASSERT(pc == state->pc - THUMB_SHORT_INSTR_SIZE);
                 return false; /* still on OP_it */
             } else {
@@ -1779,15 +1789,16 @@ instr_it_block_compute_immediates(dr_pred_type_t pred0, dr_pred_type_t pred1,
 }
 
 instr_t *
-instr_it_block_create(dcontext_t *dcontext, dr_pred_type_t pred0, dr_pred_type_t pred1,
+instr_it_block_create(void *drcontext, dr_pred_type_t pred0, dr_pred_type_t pred1,
                       dr_pred_type_t pred2, dr_pred_type_t pred3)
 {
+    dcontext_t *dcontext = (dcontext_t *)drcontext;
     byte firstcond = 0, mask = 0;
     if (!instr_it_block_compute_immediates(pred0, pred1, pred2, pred3, &firstcond,
                                            &mask)) {
         CLIENT_ASSERT(false, "invalid predicates");
     }
-    /* I did not want to include the massive instr_create.h here */
+    /* I did not want to include the massive instr_create_api.h here */
     return INSTR_CREATE_it(dcontext, OPND_CREATE_INT(firstcond), OPND_CREATE_INT(mask));
 }
 
@@ -2240,12 +2251,10 @@ read_instruction(dcontext_t *dcontext, byte *pc, byte *orig_pc,
     di->decorated_pc = pc;
     /* We support auto-decoding an LSB=1 address as Thumb (i#1688).  We don't
      * change the thread mode, just the local mode, and we return an LSB=1 next pc.
+     * We allow either of the copy or orig to have the LSB set and do not require
+     * them to match as some uses cases have a local buffer for pc.
      */
-    if (TEST(0x1, (ptr_uint_t)pc)) {
-        if (!TEST(0x1, (ptr_uint_t)orig_pc)) {
-            CLIENT_ASSERT(false, "must have consistent LSB for decode pc and orig_pc");
-            return NULL;
-        }
+    if (TEST(0x1, (ptr_uint_t)pc) || TEST(0x1, (ptr_uint_t)orig_pc)) {
         di->isa_mode = DR_ISA_ARM_THUMB;
         pc = PC_AS_LOAD_TGT(DR_ISA_ARM_THUMB, pc);
         orig_pc = PC_AS_LOAD_TGT(DR_ISA_ARM_THUMB, orig_pc);
@@ -2280,12 +2289,12 @@ read_instruction(dcontext_t *dcontext, byte *pc, byte *orig_pc,
             /* 16 bits */
             di->T32_16 = true;
             di->instr_word = di->halfwordA;
-            if (decode_in_it_block(&di->decode_state, orig_pc))
+            if (decode_in_it_block(&di->decode_state, orig_pc, di))
                 info = decode_instr_info_T32_it(di);
             else
                 info = decode_instr_info_T32_16(di);
         }
-        if (decode_in_it_block(&di->decode_state, orig_pc)) {
+        if (decode_in_it_block(&di->decode_state, orig_pc, di)) {
             if (info != NULL && info != &invalid_instr) {
                 di->predicate = decode_state_advance(&di->decode_state, di);
                 /* bkpt is always executed */
@@ -2383,9 +2392,9 @@ decode_eflags_to_instr_eflags(decode_info_t *di, const instr_info_t *info)
 }
 
 byte *
-decode_eflags_usage(dcontext_t *dcontext, byte *pc, uint *usage,
-                    dr_opnd_query_flags_t flags)
+decode_eflags_usage(void *drcontext, byte *pc, uint *usage, dr_opnd_query_flags_t flags)
 {
+    dcontext_t *dcontext = (dcontext_t *)drcontext;
     const instr_info_t *info;
     decode_info_t di;
     uint eflags;
@@ -2518,32 +2527,36 @@ decode_invalid:
 }
 
 byte *
-decode(dcontext_t *dcontext, byte *pc, instr_t *instr)
+decode(void *drcontext, byte *pc, instr_t *instr)
 {
+    dcontext_t *dcontext = (dcontext_t *)drcontext;
     return decode_common(dcontext, pc, pc, instr);
 }
 
 byte *
-decode_from_copy(dcontext_t *dcontext, byte *copy_pc, byte *orig_pc, instr_t *instr)
+decode_from_copy(void *drcontext, byte *copy_pc, byte *orig_pc, instr_t *instr)
 {
+    dcontext_t *dcontext = (dcontext_t *)drcontext;
     return decode_common(dcontext, copy_pc, orig_pc, instr);
 }
 
 byte *
-decode_cti(dcontext_t *dcontext, byte *pc, instr_t *instr)
+decode_cti(void *drcontext, byte *pc, instr_t *instr)
 {
     /* XXX i#1551: build a fast decoder for branches -- though it may not make
      * sense for 32-bit where many instrs can write to the pc.
      */
+    dcontext_t *dcontext = (dcontext_t *)drcontext;
     return decode(dcontext, pc, instr);
 }
 
 byte *
-decode_next_pc(dcontext_t *dcontext, byte *pc)
+decode_next_pc(void *drcontext, byte *pc)
 {
     /* XXX: check for invalid opcodes, though maybe it's fine to never do so
      * (xref i#1685).
      */
+    dcontext_t *dcontext = (dcontext_t *)drcontext;
     dr_isa_mode_t isa_mode;
     byte *read_pc = pc;
     if (TEST(0x1, (ptr_uint_t)pc)) {
@@ -2563,11 +2576,12 @@ decode_next_pc(dcontext_t *dcontext, byte *pc)
 }
 
 int
-decode_sizeof(dcontext_t *dcontext, byte *pc, int *num_prefixes)
+decode_sizeof(void *drcontext, byte *pc, int *num_prefixes)
 {
     /* XXX: check for invalid opcodes, though maybe it's fine to never do so
      * (xref i#1685).
      */
+    dcontext_t *dcontext = (dcontext_t *)drcontext;
     byte *next_pc = decode_next_pc(dcontext, pc);
     return next_pc - pc;
 }
@@ -3039,7 +3053,7 @@ decode_debug_checks_arch(void)
 
 #ifdef DECODE_UNIT_TEST
 /* FIXME i#1551: add unit tests here.  How divide vs suite/tests/api/ tests? */
-#    include "instr_create.h"
+#    include "instr_create_shared.h"
 
 int
 main()
