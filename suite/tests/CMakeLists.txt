@@ -3589,7 +3589,8 @@ if (BUILD_CLIENTS)
         set(tool.reuse_time_offline_rawtemp ON) # no preprocessor
 
         torunonly_simtool(counts_only_thread ${ci_shared_app}
-          "-indir ${thread_trace_dir} -simulator_type basic_counts -only_thread 10506" "")
+          "-indir ${thread_trace_dir} -simulator_type basic_counts -only_thread 3018559"
+          "")
         set(tool.counts_only_thread_rawtemp ON) # no preprocessor
       endif ()
     endif ()
@@ -3763,6 +3764,9 @@ if (BUILD_CLIENTS)
 
     torunonly_drcacheoff(instr-only-trace ${ci_shared_app} "-instr_only_trace" "" "")
     torunonly_drcacheoff(filter-and-instr-only-trace ${ci_shared_app} "-instr_only_trace -L0_filter" "" "")
+
+    torunonly_drcacheoff(interval-count-output ${ci_shared_app} ""
+      "@-simulator_type@basic_counts@-interval_microseconds@1M" "")
 
     # As for the online test, we check that only 1 thread is in the final trace.
     torunonly_drcacheoff(max-global client.annotation-concurrency
